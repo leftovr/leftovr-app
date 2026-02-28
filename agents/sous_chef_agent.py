@@ -451,29 +451,35 @@ class SousChefAgent:
 
             query_text = " ".join(query_parts) if query_parts else "dinner recipe"
 
+            allergies = user_preferences.get("allergies") or []
+
             try:
-                # Call Recipe Knowledge Agent hybrid_query
                 raw_results = self.recipe_knowledge_agent.hybrid_query(
                     pantry_items=user_ingredients,
                     query_text=query_text,
                     allow_missing=2,
                     top_k=10,
-                    use_semantic=True
+                    use_semantic=True,
+                    allergies=allergies if allergies else None,
+                    preferred_cuisines=user_preferences.get("cuisines"),
                 )
 
-                # Format results from (metadata, score, num_used, missing) tuples
                 recipe_results = []
                 for metadata, score, num_used, missing in raw_results:
+                    total_ings = len(metadata.get('ner', metadata.get('ingredients', [])))
+                    match_pct = round(num_used / total_ings * 100) if total_ings else 0
                     recipe_results.append({
                         "id": metadata.get("id"),
                         "title": metadata.get("title"),
                         "ingredients": metadata.get("ner", []),
-                        "directions": metadata.get("directions", []),  # Include original directions
+                        "ner": metadata.get("ner", []),
+                        "directions": metadata.get("directions", []),
                         "link": metadata.get("link"),
                         "source": metadata.get("source"),
                         "score": float(score),
                         "pantry_items_used": num_used,
-                        "missing_ingredients": missing
+                        "missing_ingredients": missing,
+                        "match_percentage": match_pct,
                     })
 
                 print(f"   {self.name}: Retrieved {len(recipe_results)} recipes from knowledge base")
@@ -547,17 +553,30 @@ class SousChefAgent:
                 print("⚠️  Using fallback recommendations due to parsing issues")
 
             # Merge full recipe data (including directions) into recommendations
+            # and carry over real match_percentage from the search pipeline.
             for rec in recommendations:
                 recipe_id = rec.get("recipe_id")
-                # Find matching recipe from results
                 for recipe in recipe_results:
                     if recipe.get("id") == recipe_id or recipe.get("title") == rec.get("title"):
-                        # Merge in fields that LLM doesn't return (like directions, ner, link, source)
                         rec["ner"] = recipe.get("ner", rec.get("ner", []))
                         rec["directions"] = recipe.get("directions", rec.get("directions", []))
                         rec["link"] = recipe.get("link", rec.get("link"))
                         rec["source"] = recipe.get("source", rec.get("source"))
+                        if "match_percentage" in recipe:
+                            rec["match_percentage"] = recipe["match_percentage"]
                         break
+
+            # Guarantee exactly 3 recommendations when possible.
+            if len(recommendations) < 3 and recipe_results:
+                used_ids = {r.get("recipe_id") or r.get("title") for r in recommendations}
+                fallback_pool = [r for r in recipe_results
+                                 if r.get("id") not in used_ids and r.get("title") not in used_ids]
+                extras = self.build_fallback_recommendations(fallback_pool, user_preferences)
+                for extra in extras:
+                    if len(recommendations) >= 3:
+                        break
+                    extra["rank"] = len(recommendations) + 1
+                    recommendations.append(extra)
 
             self.current_recommendations = recommendations
 
@@ -1110,14 +1129,19 @@ class SousChefAgent:
         """Generate a simple deterministic top-3 recommendation list."""
         fallback = []
         for rank, recipe in enumerate(recipe_results[:3], 1):
+            total_ings = len(recipe.get("ingredients", recipe.get("ner", [])))
+            pantry_used = recipe.get("pantry_items_used", 0)
+            match_pct = recipe.get("match_percentage",
+                                   round(pantry_used / total_ings * 100) if total_ings else 0)
             fallback.append({
                 "rank": rank,
                 "recipe_id": recipe.get("id"),
                 "title": recipe.get("title", f"Recipe {rank}"),
                 "score": float(recipe.get("score", 0)),
+                "match_percentage": match_pct,
                 "why_recommended": "High overlap with your pantry items.",
-                "pantry_items_used": recipe.get("pantry_items_used", 0),
-                "total_ingredients": len(recipe.get("ingredients", [])),
+                "pantry_items_used": pantry_used,
+                "total_ingredients": total_ings,
                 "missing_ingredients": recipe.get("missing_ingredients", []),
                 "expiring_items_used": [],
                 "time_minutes": recipe.get("time_minutes") or "?",
@@ -1125,7 +1149,10 @@ class SousChefAgent:
                 "tags": [],
                 "allergen_safe": True,
                 "dietary_compliant": True,
-                "link": recipe.get("link")
+                "link": recipe.get("link"),
+                "ner": recipe.get("ner", recipe.get("ingredients", [])),
+                "directions": recipe.get("directions", []),
+                "source": recipe.get("source"),
             })
         return fallback
 

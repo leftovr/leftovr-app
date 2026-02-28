@@ -532,29 +532,27 @@ class LeftovrWorkflow:
 
         print(f"✅ [PANTRY] Updated inventory: {len(inventory)} items")
 
-        next_stage = (
-            "presenting_options"
-            if state.get("top_3_recommendations")
-            else "pantry_complete"
-        )
-
-        return {
+        op_types = {op["type"] for op in operations} if operations else set()
+        result_dict = {
             "pantry_inventory": inventory,
             "expiring_items": expiring,
             "response": response,
-            "current_stage": next_stage,
+            "current_stage": "pantry_complete",
             "coordination_log": [f"Pantry updated via natural language"]
         }
 
+        # Clear stale recommendations when the pantry is cleared so old
+        # recipe cards don't resurface in the UI.
+        if "clear_pantry" in op_types:
+            result_dict["top_3_recommendations"] = []
+
+        return result_dict
+
     def _generate_quantity_question(self, items: List[str]) -> str:
         """
-        Generate a natural question asking for quantities of items.
-
-        Args:
-            items: List of item names
-
-        Returns:
-            Question string
+        Generate a clear question asking for quantities of each item.
+        For multiple items, uses a numbered list so the user knows exactly
+        what to answer.
         """
         if not items:
             return "❓ How many items do you have?"
@@ -562,14 +560,12 @@ class LeftovrWorkflow:
         if len(items) == 1:
             return f"❓ How many {items[0]}{'s' if not items[0].endswith('s') else ''} do you have?"
 
-        elif len(items) == 2:
-            items_str = f"{items[0]} and {items[1]}"
-            return f"❓ How many {items_str} do you have?"
-
-        else:
-            # More than 2 items
-            items_str = ", ".join(items[:-1]) + f", and {items[-1]}"
-            return f"❓ How many of each do you have? ({items_str})"
+        # Multiple items: ask for each individually with a list
+        lines = ["❓ How many of each do you have?"]
+        for item in items:
+            lines.append(f"  - {item}: ?")
+        lines.append("\n(e.g. \"3 and 2\" or \"3 {}, 2 {}\")".format(items[0], items[1]))
+        return "\n".join(lines)
 
     def _format_pantry_response_smart(self, result, inventory: List, expiring: List, operations: List[Dict]) -> str:
         """
@@ -651,7 +647,7 @@ class LeftovrWorkflow:
     def _recipe_search_node(self, state: RecipeWorkflowState) -> Dict[str, Any]:
         """
         Search for recipes using hybrid search.
-        Returns top-k results (e.g., 10 recipes).
+        Returns top-k results (e.g., 10 recipes) with scoring data preserved.
         """
         print("\n🔍 [RECIPE SEARCH] Searching for recipes...")
 
@@ -662,26 +658,47 @@ class LeftovrWorkflow:
                 "coordination_log": ["Recipe search unavailable - no data loaded"]
             }
 
-        user_msg = state.get("user_message", "")
         preferences = state.get("user_preferences", {})
         inventory = state.get("pantry_inventory", [])
 
-        # Extract pantry items as ingredient names
         pantry_items = [item.get("ingredient_name", item.get("name", "")) for item in inventory] if inventory else None
 
-        # Perform hybrid query (keyword + semantic)
+        # Build a meaningful semantic query from ingredients + preferences
+        # instead of the raw user message (e.g. "recommend me a recipe").
+        query_parts = []
+        if pantry_items:
+            query_parts.append(", ".join(pantry_items))
+        if preferences.get("cuisines"):
+            query_parts.append(" ".join(preferences["cuisines"]))
+        if preferences.get("diet"):
+            query_parts.append(preferences["diet"])
+        query_text = " ".join(query_parts) if query_parts else "dinner recipe"
+
+        allergies = preferences.get("allergies") or []
+
         try:
-            # hybrid_query returns list of (recipe_metadata, score, num_used, missing)
             results = self.recipe_agent.hybrid_query(
                 pantry_items=pantry_items,
-                query_text=user_msg,
+                query_text=query_text,
                 top_k=10,
                 allow_missing=2,
-                use_semantic=True
+                use_semantic=True,
+                allergies=allergies if allergies else None,
+                preferred_cuisines=preferences.get("cuisines"),
             )
 
-            # Extract recipe metadata from results
-            recipe_results = [recipe_meta for recipe_meta, score, num_used, missing in results]
+            # Preserve score data so the recommendation node can use real
+            # match percentages instead of LLM-fabricated numbers.
+            recipe_results = []
+            for meta, score, num_used, missing in results:
+                total_ings = len(meta.get('ner', meta.get('ingredients', [])))
+                match_pct = round(num_used / total_ings * 100) if total_ings else 0
+                entry = dict(meta)
+                entry["score"] = float(score)
+                entry["pantry_items_used"] = num_used
+                entry["missing_ingredients"] = missing
+                entry["match_percentage"] = match_pct
+                recipe_results.append(entry)
 
             print(f"✅ [RECIPE SEARCH] Found {len(recipe_results)} recipes")
 
@@ -829,8 +846,8 @@ class LeftovrWorkflow:
             if ready_time != 'N/A' or servings != 'N/A':
                 response += f"   ⏱️ {ready_time} min | 👥 {servings} servings\n"
 
-            # Show match percentage if available
-            match_pct = recipe.get("match_percentage", recipe.get("score", 0))
+            # Show match percentage from real ingredient overlap data
+            match_pct = recipe.get("match_percentage", 0)
             if match_pct:
                 response += f"   🎯 {match_pct}% ingredient match\n"
 

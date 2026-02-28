@@ -871,19 +871,35 @@ Only accept food and beverage items in the pantry."""
             # Inject pending-items context so LLM can handle quantity follow-ups
             if self.pending_items:
                 pending_str = ", ".join(self.pending_items)
+                pending_numbered = "; ".join(
+                    f"{i+1}. {name}" for i, name in enumerate(self.pending_items)
+                )
                 system_content += (
-                    f"\n\nPENDING QUANTITY CLARIFICATION: The user was previously asked "
-                    f"to provide quantities for: {pending_str}. "
-                    f"If their current message contains ANY number or quantity (digits, number "
-                    f"words like 'two', or approximate phrases like 'around 2', 'about 5', "
-                    f"'maybe 3'), call add_food_item for the pending item(s) with that quantity. "
-                    f"Extra context like 'from leftovers', 'from yesterday', 'I think', "
-                    f"'approximately', 'or so' are just qualifiers — they do NOT change the "
-                    f"item being referenced. The number ALWAYS applies to the pending item(s). "
-                    f"Examples: 'around 2 from leftovers' with pending sushi → add_food_item(name='sushi', quantity=2). "
-                    f"'maybe 5 I bought yesterday' with pending egg → add_food_item(name='egg', quantity=5). "
-                    f"ONLY ignore the pending items if the user is clearly NOT providing quantities "
-                    f"(asking about recipes, cancelling, changing topic, saying 'never mind', etc.)."
+                    f"\n\nPENDING QUANTITY CLARIFICATION:\n"
+                    f"The user was asked to provide quantities for EXACTLY these items "
+                    f"(in this order): [{pending_numbered}].\n"
+                    f"RULES (follow strictly):\n"
+                    f"1. Call add_food_item ONLY for items in the pending list above. "
+                    f"Do NOT add, modify, or set quantities for ANY other item — even if "
+                    f"that item was mentioned in earlier conversation messages.\n"
+                    f"2. If the user gives MULTIPLE numbers (e.g., '3 and 2', '3 sushi, 2 broccoli', "
+                    f"'3, 2'), map them to the pending items IN ORDER: first number → first pending "
+                    f"item, second number → second pending item, etc.\n"
+                    f"3. If the user gives a SINGLE number and there is only ONE pending item, "
+                    f"apply it to that item.\n"
+                    f"4. If the user gives a SINGLE number but there are MULTIPLE pending items, "
+                    f"apply that number to ALL pending items.\n"
+                    f"5. Extra words like 'from leftovers', 'I think', 'approximately' are just "
+                    f"qualifiers — extract only the numbers.\n"
+                    f"6. ONLY ignore the pending items if the user is clearly NOT providing "
+                    f"quantities (asking about recipes, cancelling, changing topic, saying "
+                    f"'never mind', etc.).\n"
+                    f"Examples:\n"
+                    f"- pending=[1. broccoli], user says '3' → add_food_item(name='broccoli', quantity=3)\n"
+                    f"- pending=[1. sushi; 2. broccoli], user says '5 and 2' → "
+                    f"add_food_item(name='sushi', quantity=5) AND add_food_item(name='broccoli', quantity=2)\n"
+                    f"- pending=[1. sushi; 2. broccoli], user says '3' → "
+                    f"add_food_item(name='sushi', quantity=3) AND add_food_item(name='broccoli', quantity=3)"
                 )
 
             # Build messages list with optional conversation history
@@ -916,6 +932,9 @@ Only accept food and beverage items in the pantry."""
             affected_items = []
             operations = []
             clarification_needed = False
+            # Track items the LLM tried to add without a quantity so we can
+            # merge them into pending_items for the clarification flow.
+            items_missing_qty: List[str] = []
 
             for tool_call in getattr(message, "tool_calls", []) or []:
                 func_name = tool_call.function.name
@@ -927,14 +946,14 @@ Only accept food and beverage items in the pantry."""
                     item_name = args.get("name", "")
 
                     if "quantity" not in args:
-                        print("⚠️  Warning: add_food_item called without quantity. LLM should use ask_for_quantity instead.")
+                        print(f"⚠️  Warning: add_food_item called without quantity for '{item_name}'. Will ask for quantity.")
+                        items_missing_qty.append(item_name)
                         continue
 
                     quantity = args.get("quantity", 0)
                     if quantity <= 0:
-                        print(f"⚠️  Warning: Invalid quantity {quantity} for {item_name}. Asking for clarification.")
-                        self.pending_items = [item_name]
-                        clarification_needed = True
+                        print(f"⚠️  Warning: Invalid quantity {quantity} for {item_name}. Will ask for quantity.")
+                        items_missing_qty.append(item_name)
                         continue
 
                     result = await self._add_or_update_ingredient_async(
@@ -999,6 +1018,17 @@ Only accept food and beverage items in the pantry."""
                     result = {"success": True, "needs_clarification": True, "items": items_list}
 
                 tool_results.append({"tool_name": func_name, "result": result})
+
+            # Merge any items that were skipped (no quantity) into pending_items
+            # so the clarification question covers ALL of them.
+            if items_missing_qty:
+                existing = set(self.pending_items)
+                for name in items_missing_qty:
+                    if name not in existing:
+                        self.pending_items.append(name)
+                        existing.add(name)
+                if not clarification_needed:
+                    clarification_needed = True
 
             if clarification_needed:
                 return {"needs_clarification": True, "pending_items": self.pending_items}

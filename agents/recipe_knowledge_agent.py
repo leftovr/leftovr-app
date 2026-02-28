@@ -414,7 +414,9 @@ class RecipeKnowledgeAgent:
         query_text: Optional[str] = None,
         top_k: int = 20,
         allow_missing: int = 0,
-        use_semantic: bool = True
+        use_semantic: bool = True,
+        allergies: Optional[List[str]] = None,
+        preferred_cuisines: Optional[List[str]] = None,
     ) -> List[Tuple[dict, float, int, List[str]]]:
         """
         LEFTOVR HYBRID: Cloud-based recipe search using Milvus
@@ -429,22 +431,11 @@ class RecipeKnowledgeAgent:
             top_k: Number of results to return
             allow_missing: How many ingredients you're willing to buy
             use_semantic: Whether to boost with semantic similarity
+            allergies: Ingredients/categories to exclude (e.g. ["seafood", "shrimp"])
+            preferred_cuisines: Boost recipes matching these cuisines
 
         Returns:
             List of (recipe_metadata, combined_score, num_pantry_used, missing_ingredients)
-
-            recipe_metadata includes:
-            - 'id': Recipe ID
-            - 'title': Recipe name
-            - 'ner' / 'ingredients': List of normalized ingredients
-            - 'directions': List of cooking steps (if loaded)
-            - 'link': Source URL
-            - 'source': Recipe source
-
-        Philosophy:
-            1. Prioritize using MORE leftovers (3 items > 1 item)
-            2. Prefer recipes you can make NOW (zero shopping)
-            3. Boost recipes semantically similar to your query + ingredients
         """
         # Auto-pull from pantry if not provided
         if pantry_items is None:
@@ -456,12 +447,19 @@ class RecipeKnowledgeAgent:
                 pantry_items = []
 
         pantry_list = list(pantry_items)
+        allergy_tokens = set(self.normalize_ingredients(allergies)) if allergies else set()
 
-        pantry_cands = self.pantry_candidates(
-            pantry_list,
-            allow_missing=allow_missing,
-            top_k=150,
-        )
+        # Adaptive allow_missing: start strict, loosen if too few results
+        for current_missing in range(0, allow_missing + 1):
+            pantry_cands = self.pantry_candidates(
+                pantry_list,
+                allow_missing=current_missing,
+                top_k=150,
+            )
+            # Require at least 1 pantry ingredient matched
+            pantry_cands = [(rid, sc, nu, mi) for rid, sc, nu, mi in pantry_cands if nu >= 1]
+            if len(pantry_cands) >= top_k:
+                break
 
         sem_cands = []
         if use_semantic and self.milvus_client and self.embed_model:
@@ -472,31 +470,38 @@ class RecipeKnowledgeAgent:
             )
 
         # Build combined scores
-        score_map: Dict[int, Tuple[float, int, List[str]]] = {}  # rid -> (score, num_used, missing)
+        score_map: Dict[int, Tuple[float, int, List[str]]] = {}
 
-        # Start with leftover scores (already optimized)
         for rid, leftover_score, num_used, missing in pantry_cands:
             score_map[rid] = (leftover_score, num_used, missing)
 
-        # Boost with semantic similarity if available
         if sem_cands:
             for rid, sem_score in sem_cands:
                 if rid in score_map:
                     current_score, num_used, missing = score_map[rid]
-                    # Add semantic bonus (scaled to be meaningful but not dominant)
                     boosted_score = current_score + (sem_score * 50)
                     score_map[rid] = (boosted_score, num_used, missing)
 
-        # Fetch recipe metadata from Milvus for top results
-        ranked = sorted(score_map.items(), key=lambda x: x[1][0], reverse=True)[:top_k]
+        # Fetch recipe metadata for top results
+        ranked = sorted(score_map.items(), key=lambda x: x[1][0], reverse=True)[:top_k * 3]
         recipe_ids = [rid for rid, _ in ranked]
         recipe_map = self.get_recipes_by_ids(recipe_ids)
 
-        # Return results with full metadata
-        return [
-            (recipe_map.get(rid, {'id': rid, 'title': 'Unknown', 'ner': []}), float(score), num_used, missing)
-            for rid, (score, num_used, missing) in ranked
-        ]
+        # Post-filter: exclude recipes containing allergy ingredients
+        filtered: List[Tuple[dict, float, int, List[str]]] = []
+        for rid, (score, num_used, missing) in ranked:
+            meta = recipe_map.get(rid, {'id': rid, 'title': 'Unknown', 'ner': []})
+            if allergy_tokens:
+                recipe_ings = set(self.normalize_ingredients(
+                    meta.get('ner', meta.get('ingredients', []))
+                ))
+                if allergy_tokens & recipe_ings:
+                    continue
+            filtered.append((meta, float(score), num_used, missing))
+            if len(filtered) >= top_k:
+                break
+
+        return filtered
 
 
 if __name__ == '__main__':
