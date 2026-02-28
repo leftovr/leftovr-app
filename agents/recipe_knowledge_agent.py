@@ -19,9 +19,9 @@ from typing import List, Dict, Tuple, Optional, Iterable, Set, Any
 from pymilvus import MilvusClient, DataType
 
 try:
-    from sentence_transformers import SentenceTransformer
+    from fastembed import TextEmbedding
 except Exception:
-    SentenceTransformer = None
+    TextEmbedding = None
 
 
 _UNIT_QTY_RE = re.compile(r'(^|\s)\d+\/?\d*\s*(cups?|cup|tbsp|tbs|tbsp\.|tsp|grams?|g|kg|oz|ounces?)', re.I)
@@ -82,8 +82,8 @@ class RecipeKnowledgeAgent:
         Args:
             embed_model_name: SentenceTransformer model name
         """
-        if SentenceTransformer is None:
-            print("⚠️  sentence-transformers not available, semantic search disabled")
+        if TextEmbedding is None:
+            print("⚠️  fastembed not available, semantic search disabled")
             return
 
         try:
@@ -100,9 +100,9 @@ class RecipeKnowledgeAgent:
             self.milvus_client = MilvusClient(uri=ZILLIZ_CLUSTER_ENDPOINT, token=ZILLIZ_TOKEN)
 
             # Load embedding model
-            print(f"📦 Loading embedding model: {embed_model_name}...")
-            self.embed_model = SentenceTransformer(embed_model_name)
-            self.embed_dim = self.embed_model.get_sentence_embedding_dimension()
+            print(f"📦 Loading embedding model: sentence-transformers/all-MiniLM-L6-v2...")
+            self.embed_model = TextEmbedding(model_name="sentence-transformers/all-MiniLM-L6-v2")
+            self.embed_dim = 384  # all-MiniLM-L6-v2 always outputs 384 dims
 
             # Check if collection exists
             collections = self.milvus_client.list_collections()
@@ -387,7 +387,7 @@ class RecipeKnowledgeAgent:
         query_text = ". ".join(query_parts)
 
         # Encode query using the same model (all-MiniLM-L6-v2)
-        query_vector = self.embed_model.encode(query_text, normalize_embeddings=True).tolist()
+        query_vector = list(self.embed_model.embed([query_text]))[0].tolist()
 
         # Search using MilvusClient
         results = self.milvus_client.search(

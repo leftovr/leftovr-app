@@ -970,6 +970,90 @@ class ExecutiveChefAgent:
 
         return {"query_type": qtype}
 
+    def classify_and_extract(self, llm, messages: list) -> dict:
+        """
+        One LLM call combining classify_query() + extract_preferences().
+
+        Returns a dict with keys:
+            query_type: "pantry" | "recipe" | "general"
+            allergies: list[str]
+            restrictions: list[str]
+            cuisines: list[str]
+            diet: str | None
+            skill: str | None
+
+        Falls back to {"query_type": "general", all lists empty, scalars null} on parse failure.
+        """
+        schema_instruction = (
+            "Return ONLY valid JSON matching this schema (no extra text):\n"
+            "{\n"
+            "  \"query_type\": \"pantry\" | \"recipe\" | \"general\",\n"
+            "  \"allergies\": string[] | [],\n"
+            "  \"restrictions\": string[] | [],\n"
+            "  \"cuisines\": string[] | [],\n"
+            "  \"diet\": string | null,\n"
+            "  \"skill\": string | null\n"
+            "}"
+        )
+        sys = (
+            "You analyze a conversation and return a single JSON object with two pieces of information: "
+            "(1) classify the user's most recent query as 'pantry' (adding/removing/viewing ingredients), "
+            "'recipe' (searching for or discussing recipes), or 'general' (anything else); "
+            "(2) extract any food preferences mentioned in the conversation "
+            "(allergies, dietary restrictions, preferred cuisines, diet type, cooking skill level). "
+            "Return only the JSON object and nothing else."
+        )
+
+        # Normalize messages to text format
+        normalized_msgs = []
+        for m in messages:
+            if isinstance(m, dict):
+                normalized_msgs.append(m)
+            elif hasattr(m, "content") and hasattr(m, "type"):
+                role = m.type if hasattr(m, "type") else "assistant"
+                normalized_msgs.append({"role": role, "content": m.content})
+            else:
+                normalized_msgs.append({"role": "unknown", "content": str(m)})
+
+        chat_text = "\n".join(f"{m['role'].capitalize()}: {m['content']}" for m in normalized_msgs)
+
+        resp = llm.invoke([
+            SystemMessage(content=sys),
+            HumanMessage(content=f"{schema_instruction}\n\nConversation:\n{chat_text}")
+        ])
+
+        _fallback = {
+            "query_type": "general",
+            "allergies": [], "restrictions": [], "cuisines": [],
+            "diet": None, "skill": None
+        }
+
+        try:
+            data = json.loads(resp.content)
+        except Exception as e:
+            print(f"⚠️ classify_and_extract parse failed: {e}")
+            return _fallback
+
+        def to_list(v):
+            if v is None:
+                return []
+            if isinstance(v, list):
+                return [str(x).strip() for x in v if str(x).strip()]
+            return [str(v).strip()] if str(v).strip() else []
+
+        qtype = data.get("query_type", "general")
+        if qtype not in ("pantry", "recipe", "general"):
+            qtype = "general"
+
+        return {
+            "query_type": qtype,
+            "allergies": to_list(data.get("allergies")),
+            "restrictions": to_list(data.get("restrictions")),
+            "cuisines": to_list(data.get("cuisines")),
+            "diet": data.get("diet"),
+            "skill": data.get("skill"),
+        }
+
     def pantry_info_sufficient(self, llm, user_text: str) -> dict:
         """
         Determine if pantry-related input has sufficient information for CRUD operations.

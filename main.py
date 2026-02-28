@@ -135,13 +135,28 @@ class LeftovrWorkflow:
             print(f"⚠️  Warning: Could not connect to MCP server: {e}")
             print("   Make sure mcp/server.py is available")
 
-        # Initialize Recipe Knowledge Agent (Milvus/Zilliz Cloud as primary data source)
+        # Initialize Recipe Knowledge Agent lazily — setup_milvus() is deferred to first use
+        # This avoids loading the ~22 MB ONNX model at startup (saves ~2-4 GB RAM on torch stack)
         self.recipe_agent = RecipeKnowledgeAgent(data_dir='data')
+        self._recipe_agent_initialized = False
+
+        self.sous_chef = SousChefAgent(name="Sous Chef", recipe_knowledge_agent=self.recipe_agent)
+
+        # Build workflow graph
+        self.graph = self._build_graph()
+
+    def _ensure_recipe_agent_ready(self) -> bool:
+        """
+        Lazy-initialise RecipeKnowledgeAgent on first use.
+        Returns True if the agent is ready (milvus_client connected), False otherwise.
+        """
+        if self._recipe_agent_initialized:
+            return self.recipe_agent.milvus_client is not None
+
+        self._recipe_agent_initialized = True
         try:
-            # Connect to Milvus - this is the primary data source
             self.recipe_agent.setup_milvus()
 
-            # Optional: Load directions from local file (only if needed)
             try:
                 self.recipe_agent.load_directions()
             except Exception as e:
@@ -149,23 +164,16 @@ class LeftovrWorkflow:
 
             if self.recipe_agent.milvus_client:
                 print("✅ Recipe Knowledge Agent initialized with Milvus cloud search")
+                self.recipe_agent.set_pantry_agent(self.pantry)
+                self.sous_chef.recipe_knowledge_agent = self.recipe_agent
+                return True
             else:
                 print("⚠️  Recipe Knowledge Agent: Milvus connection failed")
-                print("   Run the ingestion script: python scripts/ingest_recipes_milvus.py --input assets/full_dataset.csv --outdir data --build-milvus")
-                self.recipe_agent = None
+                print("   Run: python scripts/ingest_recipes_milvus.py --input assets/full_dataset.csv --outdir data --build-milvus")
+                return False
         except Exception as e:
-            print(f"⚠️  Warning: {e}")
-            print("   Make sure Milvus is set up and ZILLIZ_CLUSTER_ENDPOINT and ZILLIZ_TOKEN are set")
-            self.recipe_agent = None
-
-        # Wire pantry to recipe agent
-        if self.recipe_agent:
-            self.recipe_agent.set_pantry_agent(self.pantry)
-
-        self.sous_chef = SousChefAgent(name="Sous Chef", recipe_knowledge_agent=self.recipe_agent)
-
-        # Build workflow graph
-        self.graph = self._build_graph()
+            print(f"⚠️  Recipe agent init failed: {e}")
+            return False
 
     def __del__(self):
         """Cleanup: disconnect from MCP server when workflow is destroyed"""
@@ -250,16 +258,21 @@ class LeftovrWorkflow:
         if user_msg:
             messages = messages + [{"role": "user", "content": user_msg}]
 
-        # Classify query type using classifier LLM (temperature=0 for deterministic results)
-        query_classification = self.exec_chef.classify_query(llm_classifier, messages)
-        query_type = query_classification.get("query_type", "general")
+        # One LLM call: classify query AND extract preferences simultaneously
+        combined = self.exec_chef.classify_and_extract(llm_classifier, messages)
+        query_type = combined.get("query_type", "general")
 
-        # Extract user preferences for recipe and general queries (but NOT pantry)
+        # Merge extracted preferences for recipe and general queries (but NOT pantry)
         # For pantry queries, the LLM tends to misclassify ingredients as allergies
         current_prefs = state.get("user_preferences", {})
         if query_type in ["recipe", "general"]:
-            # Extract preferences from conversation using classifier LLM
-            preferences = self.exec_chef.extract_preferences(llm_classifier, messages)
+            preferences = {
+                "allergies": combined.get("allergies", []),
+                "restrictions": combined.get("restrictions", []),
+                "cuisines": combined.get("cuisines", []),
+                "diet": combined.get("diet"),
+                "skill": combined.get("skill"),
+            }
 
             # Only merge if actual preferences were found (not empty)
             has_prefs = any([
@@ -383,9 +396,26 @@ class LeftovrWorkflow:
                 "coordination_log": [f"Awaiting quantity for: {', '.join(pending_items)}"]
             }
 
-        # Get updated inventory
-        inventory = self.pantry.get_inventory()
-        expiring = self.pantry.get_expiring_soon(days_threshold=3)
+        # Get updated inventory — run both fetches in one async context to avoid
+        # spinning up two separate event loops (sequential, not gather, to avoid
+        # MCP response-queue race conditions on the single-threaded server)
+        async def _fetch_pantry_state():
+            inv = await self.pantry._get_inventory_async()
+            exp = await self.pantry._get_expiring_soon_async(days_threshold=3)
+            return inv, exp
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(asyncio.run, _fetch_pantry_state())
+                inventory, expiring = future.result()
+        else:
+            inventory, expiring = asyncio.run(_fetch_pantry_state())
 
         # Create response based on operations performed
         response = self._format_pantry_response_smart(result, inventory, expiring, user_msg)
@@ -539,7 +569,7 @@ class LeftovrWorkflow:
         """
         print("\n🔍 [RECIPE SEARCH] Searching for recipes...")
 
-        if not self.recipe_agent:
+        if not self._ensure_recipe_agent_ready():
             return {
                 "response": "⚠️  Recipe search is not available. Please run the ingestion script first.",
                 "current_stage": "error",

@@ -102,7 +102,7 @@ def render_sidebar():
         st.title("⚙️ System")
         if st.session_state.workflow:
             st.success("✅ Workflow ready")
-            if st.session_state.workflow.recipe_agent:
+            if st.session_state.workflow.recipe_agent and st.session_state.workflow.recipe_agent.milvus_client:
                 st.success("✅ Hybrid search enabled")
             else:
                 st.warning("⚠️ Hybrid search disabled")
