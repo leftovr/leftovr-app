@@ -145,93 +145,116 @@ class PantryAgent:
         # OpenAI client for natural language interpretation
         self.openai_client = openai.OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-        self.system_prompt = """
-        You are an expert Food Pantry AI Assistant with access to real-time inventory data.
+        self.system_prompt = """You are an expert Food Pantry AI Assistant with access to real-time inventory data.
 
-        Your role:
-        - Help users manage pantry inventory (FOOD ITEMS ONLY).
-        - Interpret natural language statements about food usage, consumption, or restocking.
-        - Suggest actionable recommendations.
+Your role:
+- Help users manage pantry inventory (FOOD ITEMS ONLY).
+- Interpret natural language statements about food usage, consumption, or restocking.
+- Use your natural language understanding to parse user input.
+- Handle filler phrases like "as well", "too", "also" naturally.
+- Extract food items and their quantities from context.
 
-        🎯 YOU ARE THE PRIMARY DECISION MAKER:
-        - Use your natural language understanding to parse user input
-        - Handle filler phrases like "as well", "too", "also" naturally
-        - Extract food items and their quantities from context
-        - When quantities are unclear, use ask_for_quantity tool
+Tools you can use:
+- get_all_food_items: View current inventory
+- get_expiring_soon: Get items expiring within N days
+- add_food_item: Add NEW items to the pantry (item does NOT already exist)
+- set_food_quantity: Set the EXACT quantity for an item that ALREADY exists
+- adjust_food_quantity: Adjust quantity by delta (positive/negative)
+- delete_food_item: Remove a specific item completely
+- clear_pantry: Delete ALL items from the pantry at once
+- ask_for_quantity: Ask user to clarify quantity when ambiguous
 
-        Tools you can use:
-        - get_all_food_items: View current inventory
-        - get_expiring_soon: Get items expiring within N days
-        - add_food_item: Add new items or increment quantity
-        - set_food_quantity: Set exact quantity for an item
-        - adjust_food_quantity: Adjust quantity by delta (positive/negative)
-        - delete_food_item: Remove a specific item completely
-        - clear_pantry: Delete ALL items from the pantry
-        - ask_for_quantity: Ask user to clarify quantity when plural form is used without a number
+Guidelines:
+- ONLY accept FOOD and BEVERAGE items. Reject non-food items (laptop, book, phone, etc.).
+- If the user mentions multiple items in one statement, produce one tool call per item.
+- For new items without expire_date, a 14-day default will be assigned.
 
-        Guidelines:
-        - ONLY accept FOOD and BEVERAGE items. Reject non-food items (e.g., "laptop", "book", "phone").
-        - If the user mentions multiple items in one statement, produce one tool call per item.
-        - For new items without expire_date, a 14-day default will be assigned.
+SEMANTIC GUIDANCE — ADDING ITEMS:
+- "I have X [item]" / "I bought X" / "add X" / "got X" when item is NOT in pantry:
+  * WITH explicit number ("I have 2 chickens") → add_food_item with quantity
+  * WITH "a/an" article ("I have a tomato") → add_food_item with quantity=1
+  * PLURAL without number ("I have oysters") → ask_for_quantity
+  * SINGULAR without "a/an" ("I have tomato") → ask_for_quantity (ambiguous)
+  * UNCOUNTABLE nouns ("milk", "rice", "flour") → ask_for_quantity
+- "I have X [item]" when item ALREADY EXISTS in pantry → set_food_quantity
+  (user is stating their CURRENT total, not adding more)
+- "I bought X more" / "I got X more" / "add X more" → add_food_item (explicit addition)
 
-        Semantic guidance:
-        - "I have X" / "I bought X" / "add X" / "got X":
-          * WITH explicit number (e.g., "I have 2 chickens", "I bought 5 tomatoes") → call `add_food_item` with quantity
-          * WITH "a/an" article (e.g., "I have a tomato", "I got an oyster") → call `add_food_item` with quantity=1
-          * PLURAL without number (e.g., "I have oysters", "I got tomatoes") → call `ask_for_quantity`
-          * SINGULAR without "a/an" (e.g., "I have tomato", "I have garlic") → call `ask_for_quantity` (ambiguous)
-          * UNCOUNTABLE nouns (e.g., "milk", "rice", "flour", "water") → call `ask_for_quantity`
-        - "Update to have X" / "Set to X" / "Change to X" → call `set_food_quantity` with exact quantity
-        - "I ate X" / "I used X" / "consumed X" / "cooked with X" → call `adjust_food_quantity` with negative quantity
-        - "Remove X" (NO quantity) / "Delete X" / "Get rid of X" / "Throw away X" / "I don't have X anymore" → call `delete_food_item`
-        - "Remove N X" (WITH quantity) / "Take out N X" / "Use N X" → call `adjust_food_quantity` with negative quantity
-        - "Clear pantry" / "Clear everything" / "Delete all" / "Remove all items" / "Empty pantry" → call `clear_pantry`
-        - Viewing inventory → call `get_all_food_items`
+SEMANTIC GUIDANCE — UPDATING ITEMS:
+- "Set to X" / "Update to X" / "Change to X" → set_food_quantity
+- "I have X [item]" when item exists → set_food_quantity (restating current amount)
 
-        🚨 CRITICAL RULES FOR QUANTITY CLARIFICATION:
-        1. ONLY "a/an [item]" = quantity 1 (e.g., "a tomato" = 1, "an oyster" = 1)
-        2. PLURAL without numbers = ask (e.g., "oysters", "tomatoes", "eggs")
-        3. SINGULAR without "a/an" = ask (e.g., "tomato", "garlic", "chicken" - ambiguous!)
-        4. UNCOUNTABLE nouns = ask (e.g., "milk", "rice", "flour", "water", "cheese")
-        5. EXPLICIT numbers = use that quantity (e.g., "2 eggs", "five tomatoes")
-        6. When user responds with numbers after being asked → call `add_food_item` with that quantity
+SEMANTIC GUIDANCE — REMOVING ITEMS:
+- "Remove X" / "Delete X" / "Toss X" / "Throw away X" / "Threw away X" /
+  "Get rid of X" / "Ditch X" / "I don't have X anymore" / "Clear all the X"
+  → delete_food_item (remove that SPECIFIC item)
+- "Remove N X" / "Take out N X" / "Use N X" (WITH quantity)
+  → adjust_food_quantity with negative delta
 
-        🚨 FOOD VALIDATION RULES (CRITICAL!):
-        1. ONLY accept food and beverage items (e.g., chicken, tomato, milk, bread, rice, fruits, vegetables, dairy, meat, beverages)
-        2. IMMEDIATELY REJECT non-food items (e.g., laptop, book, phone, shirt, car, furniture, electronics, clothing, tools)
-        3. If user tries to add non-food items, DO NOT call any tools - just respond naturally explaining this is a FOOD PANTRY
-        4. When in doubt, ask yourself: "Is this something you can eat or drink?" If NO → REJECT IT
+SEMANTIC GUIDANCE — CONSUMPTION:
+- "I ate N X" / "I used N X" / "consumed N X" (WITH quantity)
+  → adjust_food_quantity with negative delta
+- "I ate the X" / "I cooked with the X" / "consumed the X" (WITHOUT quantity)
+  → delete_food_item (assume ALL was used)
 
-        CRITICAL RULES FOR OTHER OPERATIONS:
-        1. "remove X" without a number → delete_food_item (remove completely)
-        2. "remove N X" with a number → adjust_food_quantity (subtract N)
-        3. "clear pantry" / "clear everything" / "empty pantry" / "delete all items" → call `clear_pantry`
-        4. NEVER use add_food_item when user says "remove", "delete", "clear", or "get rid of"
+SEMANTIC GUIDANCE — CLEARING PANTRY:
+- "Clear my pantry" / "Clear everything" / "Empty my pantry" /
+  "Delete all items" / "Remove everything"
+  → clear_pantry (empties the ENTIRE pantry)
 
-        Examples (PAY CLOSE ATTENTION):
-        ✅ CORRECT:
-        - "I have 2 eggs" → add_food_item(name="egg", quantity=2)  [Explicit number ✓]
-        - "I have a tomato" → add_food_item(name="tomato", quantity=1)  [Has "a" ✓]
-        - "I have an oyster" → add_food_item(name="oyster", quantity=1)  [Has "an" ✓]
-        - "I have oysters" → ask_for_quantity(items=["oyster"])  [Plural without number]
-        - "I have tomato" → ask_for_quantity(items=["tomato"])  [Singular without "a/an"]
-        - "I have garlic and tomato" → ask_for_quantity(items=["garlic", "tomato"])  [Both singular without "a/an"]
-        - "I have a garlic and tomato" → add_food_item("garlic",1), ask_for_quantity(["tomato"])  [Mixed]
-        - "I have milk" → ask_for_quantity(items=["milk"])  [Uncountable noun]
-        - "I bought rice" → ask_for_quantity(items=["rice"])  [Uncountable noun]
-        - "I have mango and sticky rice as well" → ask_for_quantity(items=["mango", "sticky rice"])  [Handle "as well" naturally ✓]
-        - "I got tomatoes and eggs too" → ask_for_quantity(items=["tomato", "egg"])  [Handle "too" naturally ✓]
-        - User: "I have oysters" → Bot: "How many?" → User: "3" → add_food_item(name="oyster", quantity=3)
+⚠️ CRITICAL DISTINCTION — CLEAR ITEM vs CLEAR PANTRY:
+  "clear all the eggs" → delete_food_item("egg")  [removes a SPECIFIC item]
+  "clear the chicken" → delete_food_item("chicken")  [removes a SPECIFIC item]
+  "clear everything" / "clear my pantry" → clear_pantry  [empties ENTIRE pantry]
+  The word "clear" followed by a specific food item = delete that item, NOT clear_pantry.
 
-        ❌ WRONG (NEVER DO THIS):
-        - "I have tomato" → add_food_item(name="tomato", quantity=1)  [BAD! No "a/an", ambiguous]
-        - "I have milk" → add_food_item(name="milk", quantity=1)  [BAD! Uncountable, needs clarification]
-        - "I have oysters" → add_food_item(name="oyster", quantity=1)  [BAD! Plural needs clarification]
-        - "I have a laptop" → add_food_item(name="laptop", quantity=1)  [BAD! Not food]
+CONTEXT-DEPENDENT REFERENCES (use conversation history):
+- When the user says something like "nvm i have 20 in hand", "actually there are 15",
+  "make that 20", "no wait, 5" WITHOUT naming a specific food item, look at the
+  conversation history to determine which item they are referring to. Use the most
+  recently discussed food item as the referent.
+- "nvm i have 20 in hand" after discussing eggs → set_food_quantity(name="egg", quantity=20)
+- "actually there are 15" after adding tomatoes → set_food_quantity(name="tomato", quantity=15)
+- "make that 5" after adding chicken → set_food_quantity(name="chicken", quantity=5)
+- The prefix "nvm" / "never mind" means the user is CORRECTING their previous statement,
+  not cancelling. Resolve the item from context and call the appropriate tool.
 
-        Always respond with structured tool calls when users want to modify inventory.
-        Only accept food and beverage items in the pantry.
-        """
+QUANTITY CLARIFICATION RULES:
+1. "a/an [item]" = quantity 1
+2. PLURAL without numbers = ask_for_quantity
+3. SINGULAR without "a/an" = ask_for_quantity (ambiguous)
+4. UNCOUNTABLE nouns = ask_for_quantity
+5. EXPLICIT numbers = use that quantity
+6. When user responds with numbers after being asked → add_food_item with that quantity
+
+FOOD VALIDATION RULES:
+1. ONLY accept food and beverage items
+2. REJECT non-food items (laptop, book, phone, shirt, car, furniture, electronics)
+3. If user tries to add non-food items, DO NOT call any tools — respond explaining this is a food pantry
+
+Examples:
+✅ CORRECT:
+- "I have 2 eggs" (NEW) → add_food_item(name="egg", quantity=2)
+- "I have 11 eggs" (egg ALREADY in pantry with qty 1) → set_food_quantity(name="egg", quantity=11)
+- "I have a tomato" → add_food_item(name="tomato", quantity=1)
+- "I have oysters" → ask_for_quantity(items=["oyster"])
+- "I have tomato" → ask_for_quantity(items=["tomato"])
+- "I have milk" → ask_for_quantity(items=["milk"])
+- "clear all the eggs" → delete_food_item(name="egg")
+- "toss the milk" → delete_food_item(name="milk")
+- "I threw away the bread" → delete_food_item(name="bread")
+- "I cooked with the chicken" → delete_food_item(name="chicken")
+- "I ate 2 apples" → adjust_food_quantity(name="apple", quantity=-2)
+- "clear my pantry" → clear_pantry
+
+❌ WRONG (NEVER DO THIS):
+- "I have 11 eggs" (egg exists) → add_food_item(quantity=11) [BAD! Would increment, not set]
+- "clear all the eggs" → clear_pantry [BAD! User wants to remove eggs, not empty pantry]
+- "I have tomato" → add_food_item(quantity=1) [BAD! No "a/an", ambiguous]
+- "I have a laptop" → add_food_item [BAD! Not food]
+
+Always respond with structured tool calls when users want to modify inventory.
+Only accept food and beverage items in the pantry."""
 
     # ============================================
     # MCP CLIENT IMPLEMENTATION
@@ -686,7 +709,7 @@ class PantryAgent:
     # Async method using OpenAI for query interpretation
     # ============================================
 
-    async def handle_query(self, user_query: str) -> Any:
+    async def handle_query(self, user_query: str, conversation_history: list = None) -> Any:
         """
         Process natural language queries using OpenAI.
         All operations go through MCP client.
@@ -700,9 +723,10 @@ class PantryAgent:
 
         Args:
             user_query: Natural language query from user
+            conversation_history: Optional list of prior message dicts with "role" and "content"
 
         Returns:
-            PantryItemsResponse with typed items, or None if no items affected
+            Dict with "result" (PantryItemsResponse) and "operations" list, or special dicts for clarification/cancel/error
         """
         await self.ensure_connected()
 
@@ -734,7 +758,7 @@ class PantryAgent:
                 "type": "function",
                 "function": {
                     "name": "add_food_item",
-                    "description": "Add a food/beverage item to the pantry. Use when: (1) User states explicit number ('2 chickens', '5 tomatoes'), (2) User uses singular with 'a/an' ('a tomato', 'an oyster' = quantity 1). DO NOT use for: (1) Plural without number ('oysters', 'eggs' → use ask_for_quantity), (2) Non-food items ('laptop', 'book' → reject). ONLY accept food and beverage items.",
+                    "description": "Add a NEW food/beverage item to the pantry. Use ONLY when the item does NOT already exist in the pantry. Use when: (1) User states explicit number ('2 chickens', '5 tomatoes'), (2) User uses singular with 'a/an' ('a tomato' = quantity 1). If the item ALREADY EXISTS, use set_food_quantity instead. DO NOT use for plural without number (use ask_for_quantity) or non-food items (reject).",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -757,7 +781,7 @@ class PantryAgent:
                 "type": "function",
                 "function": {
                     "name": "set_food_quantity",
-                    "description": "Set the exact quantity of a food item (use when user says 'update to have X', 'set to X', 'change to X')",
+                    "description": "Set the exact quantity of a food item. Use when: (1) user says 'set to X', 'update to X', 'change to X', or (2) user says 'I have X [item]' and the item ALREADY exists in the pantry (they are stating their current total, not adding more).",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -787,7 +811,7 @@ class PantryAgent:
                 "type": "function",
                 "function": {
                     "name": "delete_food_item",
-                    "description": "Delete/remove a food item completely from the pantry (use when user says 'remove X', 'delete X', 'I don't have X anymore')",
+                    "description": "Delete/remove a specific food item completely from the pantry. Use when user says 'remove X', 'delete X', 'toss X', 'throw away X', 'clear all the X', 'I don't have X anymore', or 'I cooked with X' (no quantity). Do NOT confuse with clear_pantry.",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -815,7 +839,7 @@ class PantryAgent:
                 "type": "function",
                 "function": {
                     "name": "clear_pantry",
-                    "description": "Delete ALL items from the pantry at once (use when user says 'clear pantry', 'empty everything', 'delete all items', 'remove everything')",
+                    "description": "Delete ALL items from the pantry at once. ONLY use when the user wants to empty the ENTIRE pantry (e.g. 'clear my pantry', 'empty everything', 'remove all items'). Do NOT use when user says 'clear all the [specific item]' — that means delete_food_item for that item.",
                     "parameters": {
                         "type": "object",
                         "properties": {},
@@ -826,28 +850,63 @@ class PantryAgent:
         ]
 
         try:
-            # Check if we have pending items and the user is providing quantities
-            if self.pending_items and self._is_quantity_response(user_query):
-                print(f"📝 Processing quantity response for pending items: {self.pending_items}")
-                return await self._handle_quantity_response(user_query)
+            # Build system content with dynamic context
+            system_content = self.system_prompt
 
-            # HYBRID APPROACH: Light pre-check + LLM intelligence
-            # Only do a SIMPLE pre-check for obvious cases (no articles, no numbers)
-            # Let the LLM handle complex parsing with its language understanding
-            simple_check = self._simple_quantity_check(user_query)
-            if simple_check.get("needs_clarification"):
-                print(f"🔍 Simple pre-check suggests asking for clarification")
-                # Don't block the LLM - just add this as context
-                # The LLM will make the final decision
+            # Inject current pantry inventory so the LLM can distinguish add vs set
+            inventory = await self._get_inventory_async()
+            if inventory:
+                inv_lines = [f"- {item['name']}: {item['quantity']}" for item in inventory]
+                system_content += (
+                    "\n\nCURRENT PANTRY INVENTORY:\n" + "\n".join(inv_lines)
+                    + "\n\nIMPORTANT: When the user says 'I have X [item]' and that item "
+                    "ALREADY EXISTS in the pantry, use set_food_quantity (not add_food_item) "
+                    "because the user is stating their CURRENT total, not adding more. "
+                    "Only use add_food_item for items NOT already in the pantry, or when "
+                    "the user explicitly says 'add', 'bought', or 'got more'."
+                )
+            else:
+                system_content += "\n\nCURRENT PANTRY INVENTORY: Empty (no items)"
 
-            # Let OpenAI interpret the query and decide which tools to call
-            # The LLM is smart enough to handle "as well", "too", etc.
+            # Inject pending-items context so LLM can handle quantity follow-ups
+            if self.pending_items:
+                pending_str = ", ".join(self.pending_items)
+                system_content += (
+                    f"\n\nPENDING QUANTITY CLARIFICATION: The user was previously asked "
+                    f"to provide quantities for: {pending_str}. "
+                    f"If their current message contains ANY number or quantity (digits, number "
+                    f"words like 'two', or approximate phrases like 'around 2', 'about 5', "
+                    f"'maybe 3'), call add_food_item for the pending item(s) with that quantity. "
+                    f"Extra context like 'from leftovers', 'from yesterday', 'I think', "
+                    f"'approximately', 'or so' are just qualifiers — they do NOT change the "
+                    f"item being referenced. The number ALWAYS applies to the pending item(s). "
+                    f"Examples: 'around 2 from leftovers' with pending sushi → add_food_item(name='sushi', quantity=2). "
+                    f"'maybe 5 I bought yesterday' with pending egg → add_food_item(name='egg', quantity=5). "
+                    f"ONLY ignore the pending items if the user is clearly NOT providing quantities "
+                    f"(asking about recipes, cancelling, changing topic, saying 'never mind', etc.)."
+                )
+
+            # Build messages list with optional conversation history
+            messages = [{"role": "system", "content": system_content}]
+            if conversation_history:
+                _type_to_role = {"human": "user", "ai": "assistant"}
+                recent = conversation_history[-6:]
+                for msg in recent:
+                    if isinstance(msg, dict):
+                        role = msg.get("role", "user")
+                        content = msg.get("content", "")
+                    elif hasattr(msg, "type") and hasattr(msg, "content"):
+                        role = _type_to_role.get(msg.type, "user")
+                        content = msg.content or ""
+                    else:
+                        continue
+                    if role in ("user", "assistant") and content:
+                        messages.append({"role": role, "content": content})
+            messages.append({"role": "user", "content": user_query})
+
             response = self.openai_client.chat.completions.create(
                 model="gpt-4o",
-                messages=[
-                    {"role": "system", "content": self.system_prompt},
-                    {"role": "user", "content": user_query}
-                ],
+                messages=messages,
                 tools=tools,
                 tool_choice="auto"
             )
@@ -855,40 +914,25 @@ class PantryAgent:
             message = response.choices[0].message
             tool_results = []
             affected_items = []
+            operations = []
             clarification_needed = False
 
-            # Execute tool calls through MCP client
             for tool_call in getattr(message, "tool_calls", []) or []:
                 func_name = tool_call.function.name
                 args = json.loads(tool_call.function.arguments)
 
                 print(f"🔧 Tool Call: {func_name}({args})")
 
-                # Execute appropriate method based on tool name
-                # All methods now go through MCP client (use async versions)
                 if func_name == "add_food_item":
                     item_name = args.get("name", "")
 
-                    # FOOD VALIDATION: Check if item is food-related
-                    if not self._is_food_item(item_name):
-                        print(f"⚠️  Rejected non-food item: {item_name}")
-                        # Return error message to inform user
-                        return {
-                            "needs_clarification": False,
-                            "error": f"Sorry, I can only manage food and beverage items in your pantry. '{item_name}' doesn't appear to be a food item. This is a food pantry assistant! 🍽️"
-                        }
-
-                    # Quantity is required - if not provided, LLM should have called ask_for_quantity
                     if "quantity" not in args:
                         print("⚠️  Warning: add_food_item called without quantity. LLM should use ask_for_quantity instead.")
                         continue
 
-                    # CRITICAL: Validate that quantity is meaningful (not a default value)
-                    # If LLM tries to infer quantity=1 when user didn't specify it, ask for clarification instead
                     quantity = args.get("quantity", 0)
                     if quantity <= 0:
                         print(f"⚠️  Warning: Invalid quantity {quantity} for {item_name}. Asking for clarification.")
-                        # Ask for clarification instead
                         self.pending_items = [item_name]
                         clarification_needed = True
                         continue
@@ -899,9 +943,9 @@ class PantryAgent:
                     )
                     if result.get("success") and result.get("data"):
                         affected_items.append(result["data"])
+                    operations.append({"type": func_name, "item": item_name, "quantity": args["quantity"]})
 
                 elif func_name == "set_food_quantity":
-                    # Set exact quantity (absolute mode)
                     item_id = normalize_food_id(args["name"])
                     result = await self._update_quantity_async(
                         ingredient_id=item_id,
@@ -910,9 +954,9 @@ class PantryAgent:
                     )
                     if result.get("success") and result.get("data"):
                         affected_items.append(result["data"])
+                    operations.append({"type": func_name, "item": args["name"], "quantity": args["quantity"]})
 
                 elif func_name == "adjust_food_quantity":
-                    # Adjust quantity by delta (delta mode)
                     item_id = normalize_food_id(args["name"])
                     result = await self._update_quantity_async(
                         ingredient_id=item_id,
@@ -921,31 +965,34 @@ class PantryAgent:
                     )
                     if result.get("success") and result.get("data"):
                         affected_items.append(result["data"])
+                    operations.append({"type": func_name, "item": args["name"], "quantity": args["quantity"]})
 
                 elif func_name == "delete_food_item":
                     result = await self._remove_ingredient_async(args["name"])
-                    # Track deleted item (data contains the item before deletion)
                     if result.get("success") and result.get("data"):
                         affected_items.append(result["data"])
+                    operations.append({"type": func_name, "item": args["name"], "quantity": None})
 
                 elif func_name == "get_all_food_items":
                     items = await self._get_inventory_async()
                     affected_items.extend(items)
                     result = {"success": True, "count": len(items)}
+                    operations.append({"type": func_name, "item": None, "quantity": None})
 
                 elif func_name == "get_expiring_soon":
                     days = args.get("days", 7)
                     items = await self._get_expiring_soon_async(days_threshold=days)
                     affected_items.extend(items)
                     result = {"success": True, "count": len(items)}
+                    operations.append({"type": func_name, "item": None, "quantity": days})
 
                 elif func_name == "clear_pantry":
                     items = await self._clear_pantry_async()
                     affected_items.extend(items)
                     result = {"success": True, "count": len(items), "message": f"Cleared {len(items)} items"}
+                    operations.append({"type": func_name, "item": None, "quantity": len(items)})
 
                 elif func_name == "ask_for_quantity":
-                    # Store pending items and set flag
                     items_list = args.get("items", [])
                     self.pending_items = items_list
                     clarification_needed = True
@@ -953,423 +1000,42 @@ class PantryAgent:
 
                 tool_results.append({"tool_name": func_name, "result": result})
 
-            # Handle clarification needed case
             if clarification_needed:
-                # Return a special response indicating clarification is needed
                 return {"needs_clarification": True, "pending_items": self.pending_items}
 
-            # Check if LLM rejected the request (no tools called, but message has content)
-            # This happens when user tries to add non-food items
+            # No tools called — LLM responded with text only
             if not tool_results and message.content:
-                # LLM responded with text but no tool calls - likely a rejection
-                return {
-                    "needs_clarification": False,
-                    "error": message.content,
-                    "rejected": True
-                }
+                had_pending = bool(self.pending_items)
+                self.pending_items = []
 
-            # Convert affected items to typed response
+                if had_pending:
+                    return {
+                        "needs_clarification": False,
+                        "cancelled": True,
+                        "message": message.content,
+                    }
+                else:
+                    return {
+                        "needs_clarification": False,
+                        "error": message.content,
+                        "rejected": True
+                    }
+
+            # Clear pending items after successful tool execution
+            if self.pending_items and operations:
+                self.pending_items = []
+
             if affected_items:
                 typed_result = convert_items(affected_items)
             else:
                 typed_result = PantryItemsResponse(items=[])
 
-            print(f"\n✅ Query processed: {len(tool_results)} tool(s) executed")
-            return typed_result
+            print(f"\n✅ Query processed: {len(tool_results)} tool(s) executed, operations: {[op['type'] for op in operations]}")
+            return {"result": typed_result, "operations": operations}
 
         except Exception as e:
             print(f"❌ Error processing query: {str(e)}")
             return None
-
-    # ============================================
-    # QUANTITY CLARIFICATION HELPERS
-    # ============================================
-
-    def _is_food_item(self, item_name: str) -> bool:
-        """
-        Validate if an item is food-related using heuristics.
-        This is a simple check - the LLM should also reject non-food items.
-
-        Args:
-            item_name: Name of the item to validate
-
-        Returns:
-            True if likely food, False otherwise
-        """
-        item_lower = item_name.lower().strip()
-
-        # Common non-food items to reject
-        non_food_keywords = [
-            # Electronics
-            "laptop", "computer", "phone", "tablet", "ipad", "iphone", "keyboard", "mouse",
-            "charger", "cable", "headphone", "speaker", "tv", "television", "monitor",
-            # Clothing
-            "shirt", "pants", "shoe", "sock", "jacket", "coat", "dress", "skirt", "hat",
-            "glove", "scarf", "belt", "tie",
-            # Other items
-            "book", "pen", "pencil", "paper", "notebook", "bag", "wallet", "key", "car",
-            "bike", "furniture", "chair", "table", "bed", "couch", "lamp", "pillow",
-            "towel", "soap", "shampoo", "toothbrush", "medicine", "pill", "vitamin"
-        ]
-
-        # Check if any non-food keyword is in the item name
-        for keyword in non_food_keywords:
-            if keyword in item_lower:
-                return False
-
-        # If it passes the non-food check, assume it's food
-        # (The LLM will do more sophisticated validation)
-        return True
-
-    def _simple_quantity_check(self, user_query: str) -> Dict[str, Any]:
-        """
-        SIMPLE pre-check to detect obvious cases where quantities are missing.
-        This is a lightweight helper - the LLM does the real heavy lifting.
-
-        Only checks for:
-        - Is this an "add" operation?
-        - Does it have any numbers?
-
-        Returns:
-            Dict with "needs_clarification" flag (doesn't block LLM)
-        """
-        import re
-
-        query_lower = user_query.lower().strip()
-
-        # Is this an add operation?
-        add_keywords = ["i have", "i've got", "i got", "i bought", "add", "put in"]
-        is_adding = any(keyword in query_lower for keyword in add_keywords)
-
-        if not is_adding:
-            return {"needs_clarification": False}
-
-        # Does it have numbers or "a/an"?
-        has_numbers = bool(re.search(r'\d+', query_lower))
-        has_articles = bool(re.search(r'\b(a|an)\s+\w+', query_lower))
-
-        # Simple heuristic: if no numbers and no articles, might need clarification
-        # But DON'T block the LLM - let it decide!
-        if not has_numbers and not has_articles:
-            return {"needs_clarification": True, "confidence": "low"}
-
-        return {"needs_clarification": False}
-
-    def _detect_items_without_quantity(self, user_query: str) -> List[str]:
-        """
-        [DEPRECATED - Kept for reference]
-
-        Complex pre-check with regex parsing.
-        This approach is fragile and requires maintaining complex patterns.
-
-        The new hybrid approach (_simple_quantity_check + LLM) is preferred because:
-        - LLM handles "as well", "too", compound phrases naturally
-        - Less maintenance burden (no regex edge cases)
-        - More robust to language variations
-
-        ORIGINAL LOGIC:
-        - "a/an [item]" → quantity = 1 (no clarification)
-        - "[plural] without number" → ask for clarification
-        - "[singular] without a/an" → ask for clarification (ambiguous)
-        - "uncountable noun" → ask for clarification (e.g., milk, rice, flour)
-
-        Args:
-            user_query: User's message
-
-        Returns:
-            List of item names (singular) that need quantity clarification, or empty list
-        """
-        import re
-
-        query_lower = user_query.lower().strip()
-
-        # Keywords that indicate adding items
-        add_keywords = [
-            "i have", "i've got", "i got", "i bought", "i purchased",
-            "just bought", "just got", "picked up", "there's", "there is",
-            "add", "put in"
-        ]
-
-        # Check if this is an add operation
-        is_adding = any(keyword in query_lower for keyword in add_keywords)
-
-        if not is_adding:
-            return []  # Not adding items, let LLM handle it
-
-        # Check if there are any explicit numbers (digits or number words)
-        has_numbers = bool(re.search(r'\d+', query_lower))
-
-        # Common number words
-        number_words = [
-            "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
-            "eleven", "twelve", "thirteen", "fourteen", "fifteen", "twenty", "thirty", "dozen"
-        ]
-        has_number_words = any(word in query_lower.split() for word in number_words)
-
-        # If there are explicit quantities, let LLM handle it normally
-        if has_numbers or has_number_words:
-            return []
-
-        # Common uncountable food nouns (always need clarification)
-        uncountable_foods = {
-            # Liquids & Beverages
-            "milk", "water", "juice", "coffee", "tea", "oil", "cream", "broth", "stock",
-            # Grains & Starches
-            "rice", "flour", "pasta", "bread", "sticky rice", "brown rice", "white rice",
-            # Proteins
-            "meat", "fish", "chicken", "beef", "pork", "bacon", "tofu", "salmon", "tuna",
-            # Dairy
-            "butter", "cheese", "yogurt", "ice cream",
-            # Sweeteners & Spreads
-            "sugar", "honey", "jam", "jelly", "peanut butter", "nutella",
-            # Condiments & Sauces
-            "salt", "pepper", "sauce", "ketchup", "mustard", "mayo", "mayonnaise",
-            "vinegar", "soy sauce", "hot sauce", "bbq sauce",
-            # Soups & Others
-            "soup", "cereal", "oatmeal", "salad"
-        }
-
-        # Extract potential food items using simple heuristics
-        stop_words = {
-            "i", "have", "got", "bought", "purchased", "just", "the", "some",
-            "and", "or", "with", "in", "my", "for", "to", "of", "is", "there", "theres",
-            "ive", "add", "put", "pantry", "well", "too", "also", "please", "thanks",
-            "as"  # Add "as" to stop words to prevent "as well" parsing issues
-        }
-
-        # Split by common separators
-        parts = re.split(r'[,;]|\band\b|\bor\b', query_lower)
-
-        items_needing_clarification = []
-
-        for part in parts:
-            # Strip trailing filler phrases like "as well", "too", "also"
-            # More robust patterns that handle various spacing
-            # IMPORTANT: Order matters! Check compound phrases first, then individual words
-            part = re.sub(r'\s+as\s+well\s+too\s*$', '', part)  # "as well too"
-            part = re.sub(r'\s+as\s+well\s*$', '', part)  # "as well"
-            part = re.sub(r'\s+well\s*$', '', part)  # standalone "well"
-            part = re.sub(r'\s+too\s*$', '', part)  # "too"
-            part = re.sub(r'\s+also\s*$', '', part)  # "also"
-
-            # Also handle leading filler words that might have been misplaced by splitting
-            part = re.sub(r'^\s*well\s+', '', part)  # "well" at the start
-            part = re.sub(r'^\s*too\s+', '', part)  # "too" at the start
-
-            # Final cleanup: remove any trailing/leading "as" that got separated
-            part = re.sub(r'\s+as\s*$', '', part)
-            part = re.sub(r'^\s*as\s+', '', part)
-
-            # Check if this part has "a" or "an" article
-            has_article_in_part = bool(re.search(r'\b(a|an)\s+\w+', part))
-
-            if has_article_in_part:
-                # This part has "a/an", so quantity = 1, skip clarification
-                print(f"✓ Detected 'a/an' in: {part.strip()}")
-                continue
-
-            words = part.strip().split()
-            # Filter out stop words
-            content_words = [w for w in words if w not in stop_words and len(w) > 2]
-
-            # If we have content words, assume they're food items
-            if content_words:
-                # For compound food names (like "sticky rice", "ice cream", "soy sauce")
-                # Take the last 2 words if available, otherwise just the last word
-                if len(content_words) >= 2:
-                    # Try compound name first
-                    compound_item = " ".join(content_words[-2:])
-                    simple_item = content_words[-1]
-
-                    # Check if compound is in uncountable list
-                    if compound_item in uncountable_foods:
-                        print(f"🔍 Detected compound uncountable: {compound_item}")
-                        items_needing_clarification.append(compound_item)
-                        continue
-
-                    # Otherwise use the simple item
-                    item = simple_item
-                else:
-                    item = content_words[-1]
-
-                # Check if it's an uncountable noun
-                if item in uncountable_foods:
-                    # Uncountable noun - needs clarification
-                    print(f"🔍 Detected uncountable noun: {item}")
-                    items_needing_clarification.append(item)
-                    continue
-
-                # Check if this word is plural
-                singular = p.singular_noun(item)
-                if singular:
-                    # It's plural! Need to ask for quantity
-                    print(f"🔍 Detected plural: {item} -> {singular}")
-                    items_needing_clarification.append(singular)
-                else:
-                    # It's singular (or inflect doesn't recognize it)
-                    # BUT no "a/an" article, so it's ambiguous
-                    # Example: "I have tomato" (could be 1 or multiple)
-                    print(f"🔍 Detected singular without article: {item}")
-                    items_needing_clarification.append(item)
-
-        if items_needing_clarification:
-            print(f"📝 Items needing clarification: {items_needing_clarification}")
-            return items_needing_clarification
-
-        return []
-
-    def _is_quantity_response(self, user_query: str) -> bool:
-        """
-        Check if user query is a quantity response (numbers or quantity phrases).
-
-        This function should return True ONLY when the user is clearly providing
-        a quantity as a response to our clarification question.
-
-        Args:
-            user_query: User's message
-
-        Returns:
-            True if this looks like a quantity response
-        """
-        query_lower = user_query.lower().strip()
-
-        # First guard: if message contains non-quantity signals, it's not a quantity response
-        NON_QUANTITY_SIGNALS = [
-            "recipe", "show me", "never mind", "nevermind", "cancel",
-            "forget", "cook", "what can", "instead", "ingredient",
-            "pantry", "find", "suggest", "recommend", "search",
-            "scratch that", "start over"
-        ]
-        if any(sig in query_lower for sig in NON_QUANTITY_SIGNALS):
-            return False
-
-        # Check for pure numbers (most common quantity response)
-        if query_lower.isdigit():
-            return True
-
-        # Number words that indicate quantity
-        number_words = [
-            "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
-            "eleven", "twelve", "thirteen", "fourteen", "fifteen", "twenty", "thirty", "dozen"
-        ]
-
-        # Check if message is short and contains numbers or quantity words
-        words = query_lower.split()
-        if len(words) <= 5:  # Short response likely to be quantity
-            # Contains digit
-            if any(char.isdigit() for char in query_lower):
-                return True
-            # Contains ONLY number words (not "got" or other action verbs)
-            if any(word in number_words for word in words):
-                return True
-
-        return False
-
-    async def _handle_quantity_response(self, user_query: str) -> Any:
-        """
-        Handle user's quantity response for pending items.
-
-        Args:
-            user_query: User's response with quantity information
-
-        Returns:
-            PantryItemsResponse with added items
-        """
-        try:
-            # Extract quantities from the response
-            quantities = self._extract_quantities(user_query)
-
-            if not quantities:
-                # Couldn't extract quantity, ask again
-                items_str = ", ".join(self.pending_items)
-                return {
-                    "needs_clarification": True,
-                    "pending_items": self.pending_items,
-                    "error": f"I couldn't understand the quantity. How many {items_str} do you have?"
-                }
-
-            # Add items with extracted quantities
-            affected_items = []
-
-            if len(quantities) == 1 and len(self.pending_items) >= 1:
-                # Single quantity for one or more items
-                # If multiple items, apply same quantity to all
-                quantity = quantities[0]
-                for item_name in self.pending_items:
-                    result = await self._add_or_update_ingredient_async(
-                        ingredient_name=item_name,
-                        quantity=quantity
-                    )
-                    if result.get("success") and result.get("data"):
-                        affected_items.append(result["data"])
-
-            elif len(quantities) == len(self.pending_items):
-                # Multiple quantities matching items count
-                for item_name, quantity in zip(self.pending_items, quantities):
-                    result = await self._add_or_update_ingredient_async(
-                        ingredient_name=item_name,
-                        quantity=quantity
-                    )
-                    if result.get("success") and result.get("data"):
-                        affected_items.append(result["data"])
-
-            else:
-                # Mismatch in counts, ask for clarification
-                items_str = ", ".join(self.pending_items)
-                return {
-                    "needs_clarification": True,
-                    "pending_items": self.pending_items,
-                    "error": f"Please specify quantities for each item: {items_str}"
-                }
-
-            # Clear pending items
-            self.pending_items = []
-
-            # Return typed response
-            if affected_items:
-                return convert_items(affected_items)
-            else:
-                return PantryItemsResponse(items=[])
-
-        except Exception as e:
-            print(f"❌ Error handling quantity response: {str(e)}")
-            self.pending_items = []  # Clear pending items on error
-            return None
-
-    def _extract_quantities(self, user_query: str) -> List[int]:
-        """
-        Extract quantity numbers from user's response.
-
-        Args:
-            user_query: User's message
-
-        Returns:
-            List of extracted quantities
-        """
-        import re
-
-        quantities = []
-        query_lower = user_query.lower().strip()
-
-        # Extract all numbers from the text
-        numbers = re.findall(r'\d+', query_lower)
-        quantities.extend([int(n) for n in numbers])
-
-        # If no numbers found, check for number words
-        if not quantities:
-            number_words = {
-                "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
-                "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
-                "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
-                "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50
-            }
-
-            words = query_lower.split()
-            for word in words:
-                if word in number_words:
-                    quantities.append(number_words[word])
-
-        return quantities
 
     # ============================================
     # UTILITY METHODS

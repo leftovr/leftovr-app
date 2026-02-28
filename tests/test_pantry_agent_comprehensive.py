@@ -49,6 +49,13 @@ class PantryAgentTester:
         self.agent = PantryAgent(name="Test Pantry Agent")
         await self.agent.ensure_connected()
 
+    async def _handle_query(self, query: str):
+        """Wrapper that unwraps the new dict return format from handle_query."""
+        result = await self._handle_query(query)
+        if isinstance(result, dict) and "result" in result and "operations" in result:
+            return result["result"]
+        return result
+
         # Clear pantry before tests
         await self.agent._clear_pantry_async()
         print("✅ Test environment ready\n")
@@ -186,7 +193,7 @@ class PantryAgentTester:
 
     async def test_nl_explicit_quantity(self):
         """Test: 'I have 5 apples' (explicit quantity)"""
-        result = await self.agent.handle_query("I have 5 apples")
+        result = await self._handle_query("I have 5 apples")
 
         passed = (
             isinstance(result, PantryItemsResponse) and
@@ -202,7 +209,7 @@ class PantryAgentTester:
 
     async def test_nl_article_a_an(self):
         """Test: 'I have a tomato' (with article = quantity 1)"""
-        result = await self.agent.handle_query("I have a tomato")
+        result = await self._handle_query("I have a tomato")
 
         passed = (
             isinstance(result, PantryItemsResponse) and
@@ -218,7 +225,7 @@ class PantryAgentTester:
 
     async def test_nl_plural_without_quantity(self):
         """Test: 'I have oysters' (plural without quantity - needs clarification)"""
-        result = await self.agent.handle_query("I have oysters")
+        result = await self._handle_query("I have oysters")
 
         # Should ask for clarification
         needs_clarification = (
@@ -238,7 +245,7 @@ class PantryAgentTester:
 
     async def test_nl_singular_without_article(self):
         """Test: 'I have garlic' (singular without article - ambiguous)"""
-        result = await self.agent.handle_query("I have garlic")
+        result = await self._handle_query("I have garlic")
 
         # Should ask for clarification
         needs_clarification = (
@@ -257,7 +264,7 @@ class PantryAgentTester:
 
     async def test_nl_uncountable_noun(self):
         """Test: 'I have milk' (uncountable - needs clarification)"""
-        result = await self.agent.handle_query("I have milk")
+        result = await self._handle_query("I have milk")
 
         # Should ask for clarification
         needs_clarification = (
@@ -280,7 +287,7 @@ class PantryAgentTester:
 
     async def test_edge_as_well(self):
         """Test: 'I have mango and sticky rice as well' (the bug we fixed!)"""
-        result = await self.agent.handle_query("I have mango and sticky rice as well")
+        result = await self._handle_query("I have mango and sticky rice as well")
 
         # Should ask for clarification for both items
         needs_clarification = isinstance(result, dict) and result.get("needs_clarification") == True
@@ -308,7 +315,7 @@ class PantryAgentTester:
 
     async def test_edge_too(self):
         """Test: 'I have tomatoes and eggs too'"""
-        result = await self.agent.handle_query("I have tomatoes and eggs too")
+        result = await self._handle_query("I have tomatoes and eggs too")
 
         # Should handle "too" correctly
         if isinstance(result, dict) and result.get("needs_clarification"):
@@ -331,7 +338,7 @@ class PantryAgentTester:
 
     async def test_edge_also(self):
         """Test: 'I got chicken also'"""
-        result = await self.agent.handle_query("I got chicken also")
+        result = await self._handle_query("I got chicken also")
 
         # Should handle "also" correctly
         if isinstance(result, dict) and result.get("needs_clarification"):
@@ -354,7 +361,7 @@ class PantryAgentTester:
 
     async def test_edge_compound_items(self):
         """Test: Compound food names like 'sticky rice', 'ice cream'"""
-        result = await self.agent.handle_query("I have 2 sticky rice and 3 ice cream")
+        result = await self._handle_query("I have 2 sticky rice and 3 ice cream")
 
         passed = isinstance(result, PantryItemsResponse) and len(result.items) >= 1
 
@@ -366,7 +373,7 @@ class PantryAgentTester:
 
     async def test_edge_mixed_quantities(self):
         """Test: Mixed - some with quantities, some without"""
-        result = await self.agent.handle_query("I have 2 apples and bananas")
+        result = await self._handle_query("I have 2 apples and bananas")
 
         # Should handle mixed case (2 apples explicit, bananas needs clarification)
         # The LLM should either add apples and ask about bananas, or ask about both
@@ -387,7 +394,7 @@ class PantryAgentTester:
 
     async def test_food_validation_reject_nonfood(self):
         """Test: Reject non-food items like 'laptop'"""
-        result = await self.agent.handle_query("I have a laptop")
+        result = await self._handle_query("I have a laptop")
 
         # Should reject non-food item - either explicit error OR no items added
         is_error = isinstance(result, dict) and "error" in result
@@ -402,7 +409,7 @@ class PantryAgentTester:
 
     async def test_food_validation_accept_food(self):
         """Test: Accept valid food items"""
-        result = await self.agent.handle_query("I have a chicken")
+        result = await self._handle_query("I have a chicken")
 
         # Should accept food item
         passed = isinstance(result, PantryItemsResponse) or (
@@ -424,7 +431,7 @@ class PantryAgentTester:
 
     async def test_multi_item_explicit_quantities(self):
         """Test: 'I bought 2 apples, 3 bananas, and 5 oranges'"""
-        result = await self.agent.handle_query("I bought 2 apples, 3 bananas, and 5 oranges")
+        result = await self._handle_query("I bought 2 apples, 3 bananas, and 5 oranges")
 
         passed = isinstance(result, PantryItemsResponse) and len(result.items) == 3
 
@@ -443,7 +450,7 @@ class PantryAgentTester:
         self.agent.add_or_update_ingredient("apple", 10)
         self.agent.add_or_update_ingredient("banana", 10)
 
-        result = await self.agent.handle_query("I ate 2 apples and 1 banana")
+        result = await self._handle_query("I ate 2 apples and 1 banana")
 
         # Check updated quantities
         inventory = self.agent.get_inventory()
@@ -465,7 +472,7 @@ class PantryAgentTester:
     async def test_quantity_clarification_flow(self):
         """Test: Full clarification flow"""
         # Step 1: User says "I have oysters"
-        result1 = await self.agent.handle_query("I have oysters")
+        result1 = await self._handle_query("I have oysters")
 
         needs_clarification = (
             isinstance(result1, dict) and
@@ -482,7 +489,7 @@ class PantryAgentTester:
             return
 
         # Step 2: User responds with "5"
-        result2 = await self.agent.handle_query("5")
+        result2 = await self._handle_query("5")
 
         added = isinstance(result2, PantryItemsResponse) and len(result2.items) > 0
 
@@ -539,7 +546,7 @@ class PantryAgentTester:
         """Test: 'I ate 2 eggs'"""
         self.agent.add_or_update_ingredient("egg", 10)
 
-        result = await self.agent.handle_query("I ate 2 eggs")
+        result = await self._handle_query("I ate 2 eggs")
 
         inventory = self.agent.get_inventory()
         egg_qty = next((item["quantity"] for item in inventory if item["name"] == "egg"), None)
@@ -556,7 +563,7 @@ class PantryAgentTester:
         """Test: 'Remove tomato' (complete removal)"""
         self.agent.add_or_update_ingredient("tomato", 5)
 
-        result = await self.agent.handle_query("Remove tomato")
+        result = await self._handle_query("Remove tomato")
 
         inventory = self.agent.get_inventory()
         has_tomato = any(item["name"] == "tomato" for item in inventory)
@@ -575,7 +582,7 @@ class PantryAgentTester:
         self.agent.add_or_update_ingredient("item1", 1)
         self.agent.add_or_update_ingredient("item2", 2)
 
-        result = await self.agent.handle_query("Clear the pantry")
+        result = await self._handle_query("Clear the pantry")
 
         inventory = self.agent.get_inventory()
 
@@ -593,7 +600,7 @@ class PantryAgentTester:
         self.agent.add_or_update_ingredient("apple", 3)
         self.agent.add_or_update_ingredient("banana", 2)
 
-        result = await self.agent.handle_query("What's in my pantry?")
+        result = await self._handle_query("What's in my pantry?")
 
         passed = isinstance(result, PantryItemsResponse) and len(result.items) >= 2
 

@@ -1011,7 +1011,10 @@ class ExecutiveChefAgent:
             "  \"diet\": string | null,\n"
             "  \"clear_diet\": true | false,\n"
             "  \"skill\": string | null,\n"
-            "  \"clear_all_preferences\": true | false\n"
+            "  \"clear_all_preferences\": true | false,\n"
+            "  \"wants_to_exit_flow\": true | false,\n"
+            "  \"is_new_recipe_search\": true | false,\n"
+            "  \"preference_action\": \"view\" | \"update\" | null\n"
             "}"
         )
         sys = (
@@ -1036,6 +1039,14 @@ class ExecutiveChefAgent:
             "'reset my food preferences', 'I want to update my allergies').\n"
             "  - 'general': anything food/cooking related that doesn't fit the above "
             "(cooking tips, ingredient questions, greetings, app help)\n\n"
+            "CONTEXT-DEPENDENT PANTRY CORRECTIONS:\n"
+            "When the user refers to a quantity WITHOUT naming a specific food item "
+            "(e.g., 'nvm i have 20 in hand', 'actually there are 15', 'make that 20', "
+            "'no wait, 5') RIGHT AFTER a pantry-related message in the conversation, "
+            "this is still a PANTRY operation — the user is correcting or updating the "
+            "quantity of the item discussed in previous turns. Classify as 'pantry', NOT 'general'. "
+            "The prefix 'nvm'/'never mind' in this context means the user is correcting "
+            "their previous statement, not exiting a flow. Set wants_to_exit_flow to false.\n\n"
             "(2) Extract and DIFF the user's food preferences from the LATEST message. "
             "Preferences can be ADDED, REMOVED, or CLEARED entirely. Use this logic:\n"
             "  - 'allergies': new allergies the user mentions they HAVE\n"
@@ -1064,6 +1075,30 @@ class ExecutiveChefAgent:
             "  'I'm not vegan anymore' → clear_diet: true\n"
             "  'I changed my mind, not Italian, give me Japanese' → removed_cuisines: ['italian'], cuisines: ['japanese']\n"
             "  'I'm not allergic to shellfish anymore' → removed_allergies: ['shellfish']\n\n"
+            "IMPLICIT REPLACEMENT (critical — 'only', 'just', 'switch to' imply clearing first):\n"
+            "  'nevermind I only want western' → clear_cuisines: true, cuisines: ['western']\n"
+            "  'actually just Italian' → clear_cuisines: true, cuisines: ['italian']\n"
+            "  'switch to keto' → clear_diet: true, diet: 'keto'\n"
+            "  'I only like Thai and Japanese' → clear_cuisines: true, cuisines: ['thai', 'japanese']\n"
+            "  'forget my old preferences, I'm vegan now' → clear_all_preferences: true, diet: 'vegan'\n"
+            "  'instead of Asian, give me Mexican' → removed_cuisines: ['asian'], cuisines: ['mexican']\n"
+            "  'no more restrictions, I eat everything' → clear_restrictions: true, clear_diet: true\n\n"
+            "KEY RULE: 'only X', 'just X', 'switch to X' = clear the ENTIRE category + set new value(s).\n"
+            "'also X', 'add X' = append without clearing.\n\n"
+            "- 'wants_to_exit_flow': true when the user wants to cancel, abort, or abandon "
+            "the current multi-turn flow (e.g., 'never mind', 'cancel', 'forget it', "
+            "'start over', 'scratch that', or pivoting to a completely different topic "
+            "mid-flow like asking for recipes while in quantity clarification). "
+            "false in all other cases.\n\n"
+            "- 'is_new_recipe_search': true when the user explicitly wants a FRESH recipe "
+            "search (e.g., 'find me something else', 'different recipe', 'search again', "
+            "'show me other options', 'try something else'). false when asking follow-up "
+            "questions about existing recommendations (e.g., 'tell me more about recipe 2', "
+            "'what's in the first one?', 'compare 1 and 3').\n\n"
+            "- 'preference_action': 'view' when the user wants to SEE their current preferences "
+            "(e.g., 'show my preferences', 'what are my settings?', 'what diet am I on?'). "
+            "'update' when they are changing/adding/removing preferences. "
+            "null when the query is not about preferences.\n\n"
             "Return only the JSON object and nothing else."
         )
 
@@ -1094,6 +1129,9 @@ class ExecutiveChefAgent:
             "diet": None, "clear_diet": False,
             "skill": None,
             "clear_all_preferences": False,
+            "wants_to_exit_flow": False,
+            "is_new_recipe_search": False,
+            "preference_action": None,
         }
 
         try:
@@ -1138,6 +1176,9 @@ class ExecutiveChefAgent:
             "clear_diet": bool(data.get("clear_diet", False)),
             "skill": data.get("skill"),
             "clear_all_preferences": bool(data.get("clear_all_preferences", False)),
+            "wants_to_exit_flow": bool(data.get("wants_to_exit_flow", False)),
+            "is_new_recipe_search": bool(data.get("is_new_recipe_search", False)),
+            "preference_action": data.get("preference_action"),
         }
 
     def pantry_info_sufficient(self, llm, user_text: str) -> dict:

@@ -1,4 +1,5 @@
 import json
+import re
 from typing import Dict, List, Any, Optional, Literal
 from datetime import datetime
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -1280,6 +1281,14 @@ class SousChefAgent:
         User's message: "{user_message}"
 
         Respond naturally and helpfully. If they make a selection, confirm it enthusiastically!
+
+        IMPORTANT: At the very end of your response, on a new line, include EXACTLY one of:
+          [SELECTION: none]
+          [SELECTION: 1]
+          [SELECTION: 2]
+          [SELECTION: 3]
+        This indicates whether the user has made a recipe selection.
+        Only set a number if the user is CLEARLY choosing that recipe.
         """
 
         context = conversation_instruction.format(
@@ -1296,6 +1305,15 @@ class SousChefAgent:
         try:
             response = llm.invoke(messages)
             reply = response.content
+
+            # LLM-based selection detection as fallback
+            tag_match = re.search(r'\[SELECTION:\s*(\w+)\]', reply)
+            if tag_match and selection is None:
+                val = tag_match.group(1)
+                if val in ('1', '2', '3'):
+                    selection = int(val)
+            # Strip the tag from the displayed reply
+            reply = re.sub(r'\s*\[SELECTION:\s*\w+\]', '', reply).strip()
 
             # Log conversation
             self.recommendation_history.append({

@@ -97,6 +97,9 @@ class RecipeWorkflowState(MessagesState):
     # Response
     response: Optional[str]  # Text response for general queries
 
+    # Classifier metadata (from classify_and_extract)
+    preference_action: Optional[str]  # "view" | "update" | None
+
     # Coordination log
     coordination_log: Annotated[List[str], operator.add]  # Workflow tracking
 
@@ -285,14 +288,22 @@ class LeftovrWorkflow:
         messages = state.get("messages", [])
         current_stage = state.get("current_stage", "initial")
 
+        # Build message list for classification
+        classify_messages = messages + [{"role": "user", "content": user_msg}] if user_msg else messages
+
+        # One LLM call: classify query AND extract preferences simultaneously
+        # Called early so new fields (wants_to_exit_flow, etc.) are available for bypass checks
+        combined = self.exec_chef.classify_and_extract(llm_classifier, classify_messages)
+        query_type = combined.get("query_type", "general")
+
         # CRITICAL: Check if we're in the middle of a multi-turn conversation
         # If awaiting clarification, route back to pantry — unless the user wants to exit
         BYPASS_STAGES = {"awaiting_quantity_clarification"}
         if current_stage in BYPASS_STAGES:
-            if self._is_exit_or_override(user_msg, current_stage):
+            if self._is_exit_or_override(user_msg, current_stage) or combined.get("wants_to_exit_flow"):
                 print("🚪 [ORCHESTRATOR] User exiting clarification flow — reclassifying")
                 self.pantry.pending_items = []  # clear stale pending items
-                # fall through to full LLM classification below
+                # fall through to full routing below
             else:
                 print("🔄 [ORCHESTRATOR] Continuing quantity clarification flow -> routing to pantry")
                 return {
@@ -301,14 +312,6 @@ class LeftovrWorkflow:
                     "current_stage": "continuing_clarification",
                     "coordination_log": ["Continuing quantity clarification conversation"]
                 }
-
-        # Build message list for classification
-        if user_msg:
-            messages = messages + [{"role": "user", "content": user_msg}]
-
-        # One LLM call: classify query AND extract preferences simultaneously
-        combined = self.exec_chef.classify_and_extract(llm_classifier, messages)
-        query_type = combined.get("query_type", "general")
 
         # Merge extracted preferences for recipe, general, selection, and preference queries.
         # For pantry queries, the LLM tends to misclassify ingredients as allergies.
@@ -398,13 +401,15 @@ class LeftovrWorkflow:
         if (current_stage == "presenting_options"
                 and state.get("top_3_recommendations")
                 and query_type == "recipe"):
+            is_new_search = combined.get("is_new_recipe_search", False)
             NEW_SEARCH_SIGNALS = [
                 "search for", "find me", "search again", "different recipe",
                 "something else", "other recipe", "start over", "new recipe",
                 "look for something", "try something else", "show me other",
                 "different options", "other options",
             ]
-            if not any(sig in user_msg.lower() for sig in NEW_SEARCH_SIGNALS):
+            has_new_search_signal = any(sig in user_msg.lower() for sig in NEW_SEARCH_SIGNALS)
+            if not is_new_search and not has_new_search_signal:
                 print("🔄 [ORCHESTRATOR] Recipe follow-up while presenting options — routing to Q&A (Path B)")
                 query_type = "general"
 
@@ -414,6 +419,7 @@ class LeftovrWorkflow:
         return {
             "query_type": query_type,
             "user_preferences": updated_prefs,
+            "preference_action": combined.get("preference_action"),
             "current_stage": f"routing_to_{query_type}",
             "coordination_log": [f"Orchestrator classified as: {query_type}"]
         }
@@ -451,13 +457,12 @@ class LeftovrWorkflow:
         print("\n🥬 [PANTRY] Processing inventory operation...")
 
         user_msg = state.get("user_message", "")
+        conversation_history = state.get("messages", [])
 
-        # Use PantryAgent's handle_query for intelligent operation detection
-        # This handles add, remove, update automatically
         import asyncio
-        result = asyncio.run(self.pantry.handle_query(user_msg))
+        result = asyncio.run(self.pantry.handle_query(user_msg, conversation_history=conversation_history))
 
-        # Check if there's an error (e.g., non-food item)
+        # Error (e.g., non-food item rejection)
         if isinstance(result, dict) and result.get("error") and not result.get("needs_clarification"):
             error_msg = result.get("error")
             print(f"❌ [PANTRY] Error: {error_msg}")
@@ -467,16 +472,25 @@ class LeftovrWorkflow:
                 "coordination_log": [f"Error: {error_msg}"]
             }
 
-        # Check if clarification is needed
+        # User cancelled during clarification ("never mind", topic switch)
+        if isinstance(result, dict) and result.get("cancelled"):
+            self.pantry.pending_items = []
+            msg = result.get("message", "No worries! What else can I help with?")
+            print(f"🚪 [PANTRY] User cancelled clarification")
+            return {
+                "response": msg,
+                "current_stage": "pantry_complete",
+                "coordination_log": ["User cancelled quantity clarification"]
+            }
+
+        # Clarification needed (ask_for_quantity was called)
         if isinstance(result, dict) and result.get("needs_clarification"):
             pending_items = result.get("pending_items", [])
             error_msg = result.get("error")
 
             if error_msg:
-                # Re-ask with error message
                 response = f"❓ {error_msg}"
             else:
-                # Generate clarification question
                 response = self._generate_quantity_question(pending_items)
 
             print(f"❓ [PANTRY] Asking for clarification: {pending_items}")
@@ -487,9 +501,15 @@ class LeftovrWorkflow:
                 "coordination_log": [f"Awaiting quantity for: {', '.join(pending_items)}"]
             }
 
-        # Get updated inventory — run both fetches in one async context to avoid
-        # spinning up two separate event loops (sequential, not gather, to avoid
-        # MCP response-queue race conditions on the single-threaded server)
+        # Extract operations and typed result from the new return format
+        if isinstance(result, dict) and "operations" in result:
+            operations = result["operations"]
+            typed_result = result["result"]
+        else:
+            operations = []
+            typed_result = result
+
+        # Get updated inventory
         async def _fetch_pantry_state():
             inv = await self.pantry._get_inventory_async()
             exp = await self.pantry._get_expiring_soon_async(days_threshold=3)
@@ -508,12 +528,10 @@ class LeftovrWorkflow:
         else:
             inventory, expiring = asyncio.run(_fetch_pantry_state())
 
-        # Create response based on operations performed
-        response = self._format_pantry_response_smart(result, inventory, expiring, user_msg)
+        response = self._format_pantry_response_smart(typed_result, inventory, expiring, operations)
 
         print(f"✅ [PANTRY] Updated inventory: {len(inventory)} items")
 
-        # If user was browsing recipes, restore that stage after pantry update
         next_stage = (
             "presenting_options"
             if state.get("top_3_recommendations")
@@ -553,86 +571,56 @@ class LeftovrWorkflow:
             items_str = ", ".join(items[:-1]) + f", and {items[-1]}"
             return f"❓ How many of each do you have? ({items_str})"
 
-    def _format_pantry_response_smart(self, result, inventory: List, expiring: List, user_msg: str) -> str:
+    def _format_pantry_response_smart(self, result, inventory: List, expiring: List, operations: List[Dict]) -> str:
         """
-        Format pantry operation result intelligently based on what operations were performed.
+        Format pantry operation result based on actual operations performed.
 
         Args:
             result: PantryItemsResponse from handle_query()
             inventory: Current inventory
             expiring: Expiring items
-            user_msg: Original user message
+            operations: List of operation dicts from handle_query, e.g. [{"type": "add_food_item", "item": "egg", "quantity": 3}]
 
         Returns:
             Formatted response string
         """
         response = ""
+        op_types = {op["type"] for op in operations} if operations else set()
 
-        # Detect operation type from user message
-        user_msg_lower = user_msg.lower()
-
-        if result and hasattr(result, 'items') and result.items:
-            affected_items = result.items
-
-            # Determine what operation was done
-            # Check for clear/empty pantry first (deletes all items)
-            if any(word in user_msg_lower for word in ["clear", "empty", "delete all", "remove all"]):
-                item_count = len(affected_items)
-                if item_count > 0:
-                    response = f"✅ I've cleared your pantry and removed {item_count} items.\n\n"
-                else:
-                    response = "✅ Your pantry is now empty.\n\n"
-
-            # Check for removal with quantity (e.g., "remove 1 garlic")
-            elif any(word in user_msg_lower for word in ["remove", "take out", "use"]) and any(char.isdigit() for char in user_msg):
-                # This is a quantity adjustment (delta)
-                items_desc = [f"{item.name}" for item in affected_items]
-                if items_desc:
-                    response = f"✅ I've removed some {', '.join(items_desc)} from your pantry.\n\n"
-                else:
-                    response = "✅ I've updated your pantry.\n\n"
-
-            # Check for complete removal (e.g., "remove garlic" - no quantity)
-            elif any(word in user_msg_lower for word in ["remove", "delete", "don't have", "gone", "throw away", "get rid of"]):
-                item_names = [item.name for item in affected_items]
-                if item_names:
-                    response = f"✅ I've completely removed {', '.join(item_names)} from your pantry.\n\n"
-                else:
-                    response = "✅ I've updated your pantry.\n\n"
-
-            elif any(word in user_msg_lower for word in ["ate", "consumed", "cooked with"]):
-                # Consumption operation (delta update)
-                item_names = [item.name for item in affected_items]
-                if item_names:
-                    response = f"✅ I've updated your inventory after using {', '.join(item_names)}.\n\n"
-                else:
-                    response = "✅ I've updated your pantry.\n\n"
-
-            elif any(word in user_msg_lower for word in ["set to", "update to", "change to", "now have"]):
-                # Set operation (absolute update)
-                items_desc = [f"{item.quantity} {item.name}" for item in affected_items]
-                if items_desc:
-                    response = f"✅ I've updated your pantry to {', '.join(items_desc)}.\n\n"
-                else:
-                    response = "✅ I've updated your pantry.\n\n"
-
+        if "clear_pantry" in op_types:
+            count = next((op["quantity"] for op in operations if op["type"] == "clear_pantry"), 0)
+            if count:
+                response = f"✅ I've cleared your pantry and removed {count} items.\n\n"
             else:
-                # Default to add operation
-                items_desc = [f"{item.quantity} {item.name}" for item in affected_items]
-                if items_desc:
-                    response = f"✅ I've added {', '.join(items_desc)} to your pantry.\n\n"
-                else:
-                    response = "✅ I've updated your pantry.\n\n"
+                response = "✅ Your pantry is now empty.\n\n"
+
+        elif "delete_food_item" in op_types:
+            names = [op["item"] for op in operations if op["type"] == "delete_food_item"]
+            response = f"✅ I've removed {', '.join(names)} from your pantry.\n\n"
+
+        elif "adjust_food_quantity" in op_types:
+            names = [op["item"] for op in operations if op["type"] == "adjust_food_quantity"]
+            response = f"✅ I've adjusted {', '.join(names)} in your pantry.\n\n"
+
+        elif "set_food_quantity" in op_types:
+            descs = [f"{op['quantity']} {op['item']}" for op in operations if op["type"] == "set_food_quantity"]
+            response = f"✅ I've updated your pantry: {', '.join(descs)}.\n\n"
+
+        elif "add_food_item" in op_types:
+            descs = [f"{op['quantity']} {op['item']}" for op in operations if op["type"] == "add_food_item"]
+            response = f"✅ I've added {', '.join(descs)} to your pantry.\n\n"
+
+        elif "get_all_food_items" in op_types or "get_expiring_soon" in op_types:
+            response = ""
+
         else:
             response = "✅ I've updated your pantry.\n\n"
 
-        # Add inventory summary
         if len(inventory) == 0:
-            response += f"📦 **Your pantry is now empty.**"
+            response += "📦 **Your pantry is now empty.**"
         else:
             response += f"📦 **Your pantry now has {len(inventory)} items.**"
 
-        # Add expiring items warning
         if expiring:
             response += f"\n⚠️  {len(expiring)} items expiring soon: "
             response += ", ".join([item.get("ingredient_name", item.get("name", "")) for item in expiring[:3]])
@@ -780,7 +768,7 @@ class LeftovrWorkflow:
             "coordination_log": [f"Sous Chef recommended {len(top_3)} recipes"]
         }
 
-    def _format_preferences_response(self, prefs: Dict[str, Any], user_msg: str) -> str:
+    def _format_preferences_response(self, prefs: Dict[str, Any], user_msg: str, preference_action: Optional[str] = None) -> str:
         """
         Format a human-readable summary of current preferences for display.
         Used by _general_response_node Path D (preference management queries).
@@ -796,7 +784,7 @@ class LeftovrWorkflow:
 
         # Detect if the user was asking to see preferences vs making a change
         view_signals = ["show", "what are", "display", "list", "tell me", "my preference", "what's my", "my setting"]
-        is_view_query = any(sig in user_msg.lower() for sig in view_signals)
+        is_view_query = (preference_action == "view") or any(sig in user_msg.lower() for sig in view_signals)
 
         if is_empty:
             header = "You don't have any preferences saved yet."
@@ -982,7 +970,8 @@ class LeftovrWorkflow:
         if query_type == "preference":
             print("⚙️  [GENERAL] Preference management query")
             prefs = state.get("user_preferences", {})
-            response = self._format_preferences_response(prefs, user_msg)
+            preference_action = state.get("preference_action")
+            response = self._format_preferences_response(prefs, user_msg, preference_action)
             return {
                 "response": response,
                 "current_stage": current_stage,   # don't disturb existing flow

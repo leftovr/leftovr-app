@@ -63,9 +63,6 @@ def init_session_state():
     if "current_stage" not in st.session_state:
         st.session_state.current_stage = "initial"
 
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-
 
 # ============================================
 # WORKFLOW INITIALIZATION
@@ -269,6 +266,12 @@ def main():
         if selected:
             with st.spinner(f"Customizing recipe {selected}..."):
                 try:
+                    # Build conversation context from chat_history
+                    context_messages = [
+                        {"role": m["role"], "content": m["content"]}
+                        for m in st.session_state.chat_history
+                    ]
+
                     # Call workflow with selection
                     result = workflow.invoke({
                         "user_message": f"I'll try recipe {selected}",
@@ -276,7 +279,7 @@ def main():
                         "pantry_inventory": st.session_state.pantry_inventory,
                         "top_3_recommendations": st.session_state.top_3_recommendations,
                         "user_recipe_selection": selected,
-                        "messages": st.session_state.messages,
+                        "messages": context_messages,
                         "coordination_log": [],
                         "current_stage": "initial"
                     })
@@ -289,7 +292,6 @@ def main():
                         })
 
                     st.session_state.current_stage = result.get("current_stage", "idle")
-                    st.session_state.messages = result.get("messages", [])
 
                     st.rerun()
 
@@ -314,13 +316,21 @@ def main():
         # Call workflow
         with st.spinner("Thinking..."):
             try:
+                # Build conversation context from chat_history (exclude the
+                # current user message — it's passed via user_message and the
+                # orchestrator appends it before classification).
+                context_messages = [
+                    {"role": m["role"], "content": m["content"]}
+                    for m in st.session_state.chat_history[:-1]
+                ]
+
                 # Invoke workflow with current state
                 result = workflow.invoke({
                     "user_message": user_input,
                     "user_preferences": st.session_state.user_preferences,
                     "pantry_inventory": st.session_state.pantry_inventory,
                     "top_3_recommendations": st.session_state.top_3_recommendations,
-                    "messages": st.session_state.messages,
+                    "messages": context_messages,
                     "coordination_log": [],
                     "current_stage": st.session_state.current_stage
                 })
@@ -334,9 +344,6 @@ def main():
 
                 if "top_3_recommendations" in result:
                     st.session_state.top_3_recommendations = result["top_3_recommendations"]
-
-                if "messages" in result:
-                    st.session_state.messages = result["messages"]
 
                 st.session_state.current_stage = result.get("current_stage", "idle")
 
