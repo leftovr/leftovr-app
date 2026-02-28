@@ -1233,6 +1233,16 @@ class PantryAgent:
         """
         query_lower = user_query.lower().strip()
 
+        # First guard: if message contains non-quantity signals, it's not a quantity response
+        NON_QUANTITY_SIGNALS = [
+            "recipe", "show me", "never mind", "nevermind", "cancel",
+            "forget", "cook", "what can", "instead", "ingredient",
+            "pantry", "find", "suggest", "recommend", "search",
+            "scratch that", "start over"
+        ]
+        if any(sig in query_lower for sig in NON_QUANTITY_SIGNALS):
+            return False
+
         # Check for pure numbers (most common quantity response)
         if query_lower.isdigit():
             return True

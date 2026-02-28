@@ -78,7 +78,7 @@ class RecipeWorkflowState(MessagesState):
     user_preferences: Dict[str, Any]  # {allergies, diet, cuisines, skill_level}
 
     # Workflow control
-    query_type: Optional[Literal["pantry", "recipe", "general"]]  # What type of request
+    query_type: Optional[Literal["pantry", "recipe", "general", "selection", "off_topic", "preference"]]  # What type of request
     current_stage: str  # Track workflow stage
 
     # Pantry data
@@ -139,6 +139,8 @@ class LeftovrWorkflow:
         # This avoids loading the ~22 MB ONNX model at startup (saves ~2-4 GB RAM on torch stack)
         self.recipe_agent = RecipeKnowledgeAgent(data_dir='data')
         self._recipe_agent_initialized = False
+        self._warmup_started = False
+        self._warmup_future = None
 
         self.sous_chef = SousChefAgent(name="Sous Chef", recipe_knowledge_agent=self.recipe_agent)
 
@@ -149,7 +151,13 @@ class LeftovrWorkflow:
         """
         Lazy-initialise RecipeKnowledgeAgent on first use.
         Returns True if the agent is ready (milvus_client connected), False otherwise.
+        Thread-safe: if a background warmup is in progress, waits for it.
         """
+        if self._warmup_future is not None and not self._recipe_agent_initialized:
+            print("⏳ Waiting for background warmup to finish...")
+            self._warmup_future.result(timeout=60)
+            return self.recipe_agent.milvus_client is not None
+
         if self._recipe_agent_initialized:
             return self.recipe_agent.milvus_client is not None
 
@@ -174,6 +182,22 @@ class LeftovrWorkflow:
         except Exception as e:
             print(f"⚠️  Recipe agent init failed: {e}")
             return False
+
+    def start_background_warmup(self) -> None:
+        """
+        Kick off Zilliz/fastembed initialization in a background thread so the
+        first recipe query doesn't block.  Safe to call multiple times — only
+        the first call actually spawns work.
+        """
+        if self._warmup_started:
+            return
+        self._warmup_started = True
+
+        import concurrent.futures
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self._warmup_future = executor.submit(self._ensure_recipe_agent_ready)
+        executor.shutdown(wait=False)
+        print("🔄 Background warmup started for Recipe Knowledge Agent")
 
     def __del__(self):
         """Cleanup: disconnect from MCP server when workflow is destroyed"""
@@ -232,6 +256,24 @@ class LeftovrWorkflow:
     # NODE 1: ORCHESTRATOR (Executive Chef)
     # ============================================
 
+    def _is_exit_or_override(self, user_msg: str, current_stage: str) -> bool:
+        """Detect if the user wants to cancel/override the current multi-turn flow."""
+        msg = user_msg.lower().strip()
+        EXIT_PHRASES = [
+            "never mind", "nevermind", "nvm", "forget it", "forget that",
+            "cancel", "start over", "ignore that", "scratch that",
+        ]
+        if any(p in msg for p in EXIT_PHRASES):
+            return True
+        if current_stage == "awaiting_quantity_clarification":
+            RECIPE_SWITCH_SIGNALS = [
+                "recipe", "cook", "make with", "what can i", "show me",
+                "find me", "suggest", "recommend"
+            ]
+            if any(p in msg for p in RECIPE_SWITCH_SIGNALS):
+                return True
+        return False
+
     def _orchestrator_node(self, state: RecipeWorkflowState) -> Dict[str, Any]:
         """
         Single entry point - classify query and decide routing.
@@ -244,15 +286,21 @@ class LeftovrWorkflow:
         current_stage = state.get("current_stage", "initial")
 
         # CRITICAL: Check if we're in the middle of a multi-turn conversation
-        # If awaiting clarification, route back to pantry without classification
-        if current_stage == "awaiting_quantity_clarification":
-            print("🔄 [ORCHESTRATOR] Continuing quantity clarification flow -> routing to pantry")
-            return {
-                "query_type": "pantry",
-                "user_preferences": state.get("user_preferences", {}),
-                "current_stage": "continuing_clarification",
-                "coordination_log": ["Continuing quantity clarification conversation"]
-            }
+        # If awaiting clarification, route back to pantry — unless the user wants to exit
+        BYPASS_STAGES = {"awaiting_quantity_clarification"}
+        if current_stage in BYPASS_STAGES:
+            if self._is_exit_or_override(user_msg, current_stage):
+                print("🚪 [ORCHESTRATOR] User exiting clarification flow — reclassifying")
+                self.pantry.pending_items = []  # clear stale pending items
+                # fall through to full LLM classification below
+            else:
+                print("🔄 [ORCHESTRATOR] Continuing quantity clarification flow -> routing to pantry")
+                return {
+                    "query_type": "pantry",
+                    "user_preferences": state.get("user_preferences", {}),
+                    "current_stage": "continuing_clarification",
+                    "coordination_log": ["Continuing quantity clarification conversation"]
+                }
 
         # Build message list for classification
         if user_msg:
@@ -262,63 +310,103 @@ class LeftovrWorkflow:
         combined = self.exec_chef.classify_and_extract(llm_classifier, messages)
         query_type = combined.get("query_type", "general")
 
-        # Merge extracted preferences for recipe and general queries (but NOT pantry)
-        # For pantry queries, the LLM tends to misclassify ingredients as allergies
+        # Merge extracted preferences for recipe, general, selection, and preference queries.
+        # For pantry queries, the LLM tends to misclassify ingredients as allergies.
+        # Supports dynamic updates: add, remove specific items, clear a category, or clear all.
         current_prefs = state.get("user_preferences", {})
-        if query_type in ["recipe", "general"]:
-            preferences = {
-                "allergies": combined.get("allergies", []),
-                "restrictions": combined.get("restrictions", []),
-                "cuisines": combined.get("cuisines", []),
-                "diet": combined.get("diet"),
-                "skill": combined.get("skill"),
-            }
+        if query_type in ["recipe", "general", "selection", "preference"]:
+            updated_prefs = {**current_prefs}
 
-            # Only merge if actual preferences were found (not empty)
-            has_prefs = any([
-                preferences.get("allergies"),
-                preferences.get("restrictions"),
-                preferences.get("cuisines"),
-                preferences.get("diet"),
-                preferences.get("skill")
-            ])
+            # "clear all" wipes everything first; individual category clears/adds/removes still apply
+            if combined.get("clear_all_preferences"):
+                updated_prefs = {"allergies": [], "restrictions": [], "cuisines": [],
+                                 "diet": None, "skill": None}
+                print("🗑️  [ORCHESTRATOR] Cleared ALL preferences")
 
-            if has_prefs:
-                # Merge lists (allergies, restrictions, cuisines)
-                updated_prefs = {**current_prefs}
-                for key in ["allergies", "restrictions", "cuisines"]:
-                    existing = list(current_prefs.get(key, []))
-                    new_items = list(preferences.get(key, []))
-                    if new_items:
-                        existing.extend(new_items)
-                        updated_prefs[key] = list(set(existing))  # Remove duplicates
+            # Apply add/remove diff for each list-type preference
+            for key in ("allergies", "restrictions", "cuisines"):
+                clear_key = f"clear_{key}"
+                remove_key = f"removed_{key}"
 
-                # Override single values (diet, skill)
-                if preferences.get("diet"):
-                    updated_prefs["diet"] = preferences["diet"]
-                if preferences.get("skill"):
-                    updated_prefs["skill"] = preferences["skill"]
-            else:
-                # No preferences found, keep existing
-                updated_prefs = current_prefs
+                # Category-level clear (runs after global clear so any additions below still apply)
+                if combined.get(clear_key):
+                    updated_prefs[key] = []
+                    print(f"🗑️  [ORCHESTRATOR] Cleared all {key}")
+
+                existing = [x.lower() for x in updated_prefs.get(key, [])]
+                add_items = [x.lower() for x in combined.get(key, []) if x.strip()]
+                drop_items = {x.lower() for x in combined.get(remove_key, []) if x.strip()}
+
+                merged = list(dict.fromkeys(existing + add_items))   # dedupe, preserve order
+                merged = [x for x in merged if x not in drop_items]
+
+                if merged != existing:
+                    updated_prefs[key] = merged
+                    if drop_items:
+                        print(f"🗑️  [ORCHESTRATOR] Removed from {key}: {drop_items}")
+                    if add_items:
+                        print(f"➕ [ORCHESTRATOR] Added to {key}: {add_items}")
+
+            # Diet: explicit clear trumps a new value; new value overrides existing
+            if combined.get("clear_diet"):
+                updated_prefs["diet"] = None
+                print("🗑️  [ORCHESTRATOR] Cleared diet preference")
+            elif combined.get("diet"):
+                updated_prefs["diet"] = combined["diet"]
+
+            # Skill: always override if provided
+            if combined.get("skill"):
+                updated_prefs["skill"] = combined["skill"]
         else:
             # For pantry queries, keep existing preferences unchanged
             updated_prefs = current_prefs
 
-        # Check if user is selecting a recipe (1, 2, or 3)
-        selection_keywords = ["i'll try", "i'll take", "give me recipe", "option", "choice"]
-        if any(keyword in user_msg.lower() for keyword in selection_keywords):
-            # Try to extract recipe number
-            for i in [1, 2, 3]:
-                if str(i) in user_msg or ["one", "two", "three"][i-1] in user_msg.lower():
-                    print(f"✅ [ORCHESTRATOR] User selected recipe {i}")
-                    return {
-                        "query_type": "recipe",
-                        "user_preferences": updated_prefs,
-                        "user_recipe_selection": i,
-                        "current_stage": "customization",
-                        "coordination_log": [f"User selected recipe #{i}"]
-                    }
+        # Use LLM-detected selection
+        if query_type == "selection":
+            recipe_num = combined.get("selected_recipe_number")
+            top_3 = state.get("top_3_recommendations", [])
+            if recipe_num and 1 <= recipe_num <= len(top_3):
+                print(f"✅ [ORCHESTRATOR] LLM-detected selection: recipe #{recipe_num}")
+                return {
+                    "query_type": "selection",
+                    "user_preferences": updated_prefs,
+                    "user_recipe_selection": recipe_num,
+                    "current_stage": "customization",
+                    "coordination_log": [f"LLM-detected selection: recipe #{recipe_num}"]
+                }
+            else:
+                # No valid context — fall to general for a "please pick 1-3" reply
+                query_type = "general"
+
+        # Fallback: bare digit while in presenting_options OR awaiting_selection
+        if (user_msg.strip() in ("1", "2", "3")
+                and state.get("current_stage") in ("presenting_options", "awaiting_selection")
+                and state.get("top_3_recommendations")):
+            num = int(user_msg.strip())
+            print(f"✅ [ORCHESTRATOR] Bare digit selection: recipe #{num}")
+            return {
+                "query_type": "selection",
+                "user_preferences": updated_prefs,
+                "user_recipe_selection": num,
+                "current_stage": "customization",
+                "coordination_log": [f"Bare digit selection: recipe #{num}"]
+            }
+
+        # Context guard: while recipe cards are on screen, keep follow-up questions
+        # in Path B (recipe Q&A) rather than triggering a whole new search.
+        # Only break out of context when user clearly wants a fresh search.
+        if (current_stage == "presenting_options"
+                and state.get("top_3_recommendations")
+                and query_type == "recipe"):
+            NEW_SEARCH_SIGNALS = [
+                "search for", "find me", "search again", "different recipe",
+                "something else", "other recipe", "start over", "new recipe",
+                "look for something", "try something else", "show me other",
+                "different options", "other options",
+            ]
+            if not any(sig in user_msg.lower() for sig in NEW_SEARCH_SIGNALS):
+                print("🔄 [ORCHESTRATOR] Recipe follow-up while presenting options — routing to Q&A (Path B)")
+                query_type = "general"
 
         print(f"📋 [ORCHESTRATOR] Query type: {query_type}")
         print(f"👤 [ORCHESTRATOR] Preferences: {updated_prefs}")
@@ -343,6 +431,9 @@ class LeftovrWorkflow:
             "pantry": "pantry",
             "ingredient": "pantry",
             "recipe": "recipe",
+            "selection": "selection",   # direct to customization node
+            "off_topic": "general",     # politely declined in general_response node
+            "preference": "general",    # preference mgmt handled in general_response Path D
             "general": "general"
         }
 
@@ -422,11 +513,18 @@ class LeftovrWorkflow:
 
         print(f"✅ [PANTRY] Updated inventory: {len(inventory)} items")
 
+        # If user was browsing recipes, restore that stage after pantry update
+        next_stage = (
+            "presenting_options"
+            if state.get("top_3_recommendations")
+            else "pantry_complete"
+        )
+
         return {
             "pantry_inventory": inventory,
             "expiring_items": expiring,
             "response": response,
-            "current_stage": "pantry_complete",
+            "current_stage": next_stage,
             "coordination_log": [f"Pantry updated via natural language"]
         }
 
@@ -632,8 +730,18 @@ class LeftovrWorkflow:
         expiring = state.get("expiring_items", [])
 
         if not recipe_results:
+            if not inventory:
+                return {
+                    "response": (
+                        "Your pantry is empty, so I can't match recipes to your ingredients yet. "
+                        "Try telling me what you have — for example: "
+                        "*\"I have chicken, garlic, and pasta\"* — and I'll suggest recipes right away!"
+                    ),
+                    "current_stage": "no_results",
+                    "coordination_log": ["No recipes found — pantry empty"]
+                }
             return {
-                "response": "😕 I couldn't find any recipes matching your criteria.",
+                "response": "😕 I couldn't find any recipes matching your criteria. Try broadening your search or adding more ingredients to your pantry.",
                 "current_stage": "no_results",
                 "coordination_log": ["No recipes found to recommend"]
             }
@@ -644,6 +752,14 @@ class LeftovrWorkflow:
             "total_ingredients": len(inventory)
         }
 
+        # Soft notice when pantry is empty but semantic search still returned results
+        empty_pantry_note = ""
+        if not inventory:
+            empty_pantry_note = (
+                "\n\n💡 *Your pantry is empty — these are general suggestions. "
+                "Tell me what ingredients you have and I'll find recipes that use them!*"
+            )
+
         top_3 = self.sous_chef.generate_recommendations(
             llm=llm_creative,  # Use creative LLM for recommendations
             pantry_summary=pantry_summary,
@@ -653,7 +769,7 @@ class LeftovrWorkflow:
         )
 
         # Format response
-        response = self._format_recommendations(top_3, expiring)
+        response = self._format_recommendations(top_3, expiring) + empty_pantry_note
 
         print(f"✅ [RECOMMENDATION] Selected top 3 recipes")
 
@@ -663,6 +779,49 @@ class LeftovrWorkflow:
             "current_stage": "presenting_options",
             "coordination_log": [f"Sous Chef recommended {len(top_3)} recipes"]
         }
+
+    def _format_preferences_response(self, prefs: Dict[str, Any], user_msg: str) -> str:
+        """
+        Format a human-readable summary of current preferences for display.
+        Used by _general_response_node Path D (preference management queries).
+        Shows what changed when edits were made, or just displays current state.
+        """
+        allergies = prefs.get("allergies") or []
+        restrictions = prefs.get("restrictions") or []
+        cuisines = prefs.get("cuisines") or []
+        diet = prefs.get("diet")
+        skill = prefs.get("skill")
+
+        is_empty = not any([allergies, restrictions, cuisines, diet, skill])
+
+        # Detect if the user was asking to see preferences vs making a change
+        view_signals = ["show", "what are", "display", "list", "tell me", "my preference", "what's my", "my setting"]
+        is_view_query = any(sig in user_msg.lower() for sig in view_signals)
+
+        if is_empty:
+            header = "You don't have any preferences saved yet."
+            tip = " Tell me your allergies, preferred cuisines, or dietary needs and I'll remember them!"
+            return f"⚙️ **Your Preferences**\n\n{header}{tip}"
+
+        lines = ["⚙️ **Your Current Preferences**\n"]
+
+        if allergies:
+            lines.append(f"🚫 **Allergies:** {', '.join(a.title() for a in allergies)}")
+        if restrictions:
+            lines.append(f"⛔ **Dietary Restrictions:** {', '.join(r.title() for r in restrictions)}")
+        if cuisines:
+            lines.append(f"🌍 **Preferred Cuisines:** {', '.join(c.title() for c in cuisines)}")
+        if diet:
+            lines.append(f"🥗 **Diet:** {diet.title()}")
+        if skill:
+            lines.append(f"👨‍🍳 **Skill Level:** {skill.title()}")
+
+        if not is_view_query:
+            lines.append("\n✅ Preferences updated! These will be applied to your next recipe search.")
+        else:
+            lines.append("\n💡 You can update these anytime — just tell me what to change or remove.")
+
+        return "\n".join(lines)
 
     def _format_recommendations(self, top_3: List[Dict], expiring: List) -> str:
         """Format top 3 recommendations for user"""
@@ -768,14 +927,69 @@ class LeftovrWorkflow:
 
     def _general_response_node(self, state: RecipeWorkflowState) -> Dict[str, Any]:
         """
-        Handle general conversation - cooking questions, greetings, etc.
-        No agent calls needed.
+        Handle general conversation - three paths:
+          A) off_topic: politely decline and redirect
+          B) presenting_options + top_3: recipe Q&A with context preservation
+          C) default: waiter-mode general response
         """
         print("\n💬 [GENERAL] Handling general query...")
 
         user_msg = state.get("user_message", "")
+        current_stage = state.get("current_stage", "")
+        top_3 = state.get("top_3_recommendations", [])
+        query_type = state.get("query_type", "general")
 
-        # Use Executive Chef for general responses
+        # Path A: Off-topic — politely decline
+        if query_type == "off_topic":
+            print("🚫 [GENERAL] Off-topic query — declining")
+            response = (
+                "I'm your kitchen assistant! I can help you manage your pantry, "
+                "find recipes based on what you have, and guide you through cooking. "
+                "I'm not able to help with that, but feel free to ask me anything food-related!"
+            )
+            return {
+                "response": response,
+                "current_stage": current_stage,   # don't disturb existing flow
+                "coordination_log": ["Off-topic query declined"]
+            }
+
+        # Path B: Recipe browsing Q&A — stay in context
+        if current_stage == "presenting_options" and top_3:
+            print("💬 [GENERAL] Recipe Q&A while browsing options")
+            result = self.sous_chef.converse_about_recommendations(
+                llm_creative,
+                top_3,
+                user_msg,
+                state.get("user_preferences", {})
+            )
+            detected_selection = result.get("selection")
+            if detected_selection and 1 <= detected_selection <= len(top_3):
+                return {
+                    "response": result.get("reply", ""),
+                    "top_3_recommendations": top_3,
+                    "user_recipe_selection": detected_selection,
+                    "current_stage": "customization",
+                    "coordination_log": [f"Recipe Q&A; selection {detected_selection} detected"]
+                }
+            return {
+                "response": result.get("reply", ""),
+                "top_3_recommendations": top_3,   # preserve cards in Streamlit
+                "current_stage": "presenting_options",
+                "coordination_log": ["Recipe Q&A, no selection"]
+            }
+
+        # Path D: Preference management — show current prefs or confirm changes
+        if query_type == "preference":
+            print("⚙️  [GENERAL] Preference management query")
+            prefs = state.get("user_preferences", {})
+            response = self._format_preferences_response(prefs, user_msg)
+            return {
+                "response": response,
+                "current_stage": current_stage,   # don't disturb existing flow
+                "coordination_log": ["Preference management query handled"]
+            }
+
+        # Path C: Default general response (waiter mode)
         response = self.exec_chef.respond_as_waiter(llm, user_msg)
 
         print(f"✅ [GENERAL] Responded to general query")

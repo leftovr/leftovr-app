@@ -3,10 +3,31 @@ Leftovr - Streamlit Frontend (Pure UI)
 Uses main.py workflow as backend
 """
 
+import os
 import streamlit as st
 import asyncio
 from typing import Dict, List, Any
 from datetime import datetime
+
+# Bridge Streamlit Secrets → os.environ (Streamlit Cloud production support)
+# Must happen before importing main.py, which reads env vars at import time.
+# Local .env values take precedence (we skip keys already in os.environ).
+_SECRET_KEYS = [
+    "OPENAI_API_KEY",
+    "ZILLIZ_CLUSTER_ENDPOINT",
+    "ZILLIZ_TOKEN",
+    "LANGCHAIN_API_KEY",
+    "LANGCHAIN_PROJECT",
+    "LANGCHAIN_TRACING_V2",
+]
+for _key in _SECRET_KEYS:
+    if _key not in os.environ:
+        try:
+            _val = st.secrets.get(_key)
+            if _val:
+                os.environ[_key] = str(_val)
+        except Exception:
+            pass  # st.secrets unavailable in local dev without secrets.toml
 
 # Import the refactored workflow
 from main import create_workflow
@@ -102,10 +123,15 @@ def render_sidebar():
         st.title("⚙️ System")
         if st.session_state.workflow:
             st.success("✅ Workflow ready")
-            if st.session_state.workflow.recipe_agent and st.session_state.workflow.recipe_agent.milvus_client:
+            agent = st.session_state.workflow.recipe_agent
+            if agent and agent.milvus_client:
                 st.success("✅ Hybrid search enabled")
+            elif agent and st.session_state.workflow._recipe_agent_initialized:
+                # Initialized but failed (bad creds, no collection, etc.)
+                st.warning("⚠️ Hybrid search unavailable")
             else:
-                st.warning("⚠️ Hybrid search disabled")
+                # Lazy init has not run yet — will attempt on first recipe query
+                st.info("🔄 Search ready (initialises on first recipe query)")
         else:
             st.error("❌ Workflow not initialized")
 
@@ -202,6 +228,9 @@ def main():
             st.error(f"❌ Failed to initialize workflow: {error}")
             st.stop()
         st.session_state.workflow = workflow
+
+        # Start Zilliz/fastembed init in background so the first recipe query is fast
+        workflow.start_background_warmup()
 
         # Load initial pantry inventory from MCP database
         try:

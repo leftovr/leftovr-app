@@ -666,10 +666,11 @@ class ExecutiveChefAgent:
         """Return the user interface prompt for conversation handling."""
         if context == "general":
             return (
-                "You are a friendly virtual assistant. "
-                "Answer the user's question naturally. "
-                "If it's not about food, just provide the info politely. "
-                "Do not ask about diet, allergies, or cuisines unless the user brings it up."
+                "You are a friendly kitchen assistant. "
+                "You ONLY answer questions about food, cooking, recipes, nutrition, pantry management, and dining. "
+                "If asked about anything unrelated to food or cooking, politely decline and redirect the user "
+                "to ask a food-related question. "
+                "Do not ask about diet, allergies, or cuisines unless the user brings it up. "
                 "DO NOT PROVIDE RECIPES."
             )
         if context == "pantry":
@@ -975,32 +976,94 @@ class ExecutiveChefAgent:
         One LLM call combining classify_query() + extract_preferences().
 
         Returns a dict with keys:
-            query_type: "pantry" | "recipe" | "general"
-            allergies: list[str]
-            restrictions: list[str]
-            cuisines: list[str]
-            diet: str | None
+            query_type: "pantry"|"recipe"|"general"|"selection"|"off_topic"|"preference"
+            selected_recipe_number: 1 | 2 | 3 | None
+            allergies: list[str]             — allergies to ADD
+            removed_allergies: list[str]     — specific allergies to REMOVE
+            clear_allergies: bool            — clear the entire allergies list
+            restrictions: list[str]          — restrictions to ADD
+            removed_restrictions: list[str]  — specific restrictions to REMOVE
+            clear_restrictions: bool         — clear the entire restrictions list
+            cuisines: list[str]              — cuisines to ADD/prefer
+            removed_cuisines: list[str]      — specific cuisines to REMOVE/avoid
+            clear_cuisines: bool             — clear the entire cuisines list
+            diet: str | None                 — set diet (None = no change)
+            clear_diet: bool                 — True if user explicitly removes their diet
             skill: str | None
+            clear_all_preferences: bool      — wipe all preference fields at once
 
-        Falls back to {"query_type": "general", all lists empty, scalars null} on parse failure.
+        Falls back to {"query_type": "general", all lists empty, all flags false} on parse failure.
         """
         schema_instruction = (
             "Return ONLY valid JSON matching this schema (no extra text):\n"
             "{\n"
-            "  \"query_type\": \"pantry\" | \"recipe\" | \"general\",\n"
+            "  \"query_type\": \"pantry\" | \"recipe\" | \"general\" | \"selection\" | \"off_topic\" | \"preference\",\n"
+            "  \"selected_recipe_number\": 1 | 2 | 3 | null,\n"
             "  \"allergies\": string[] | [],\n"
+            "  \"removed_allergies\": string[] | [],\n"
+            "  \"clear_allergies\": true | false,\n"
             "  \"restrictions\": string[] | [],\n"
+            "  \"removed_restrictions\": string[] | [],\n"
+            "  \"clear_restrictions\": true | false,\n"
             "  \"cuisines\": string[] | [],\n"
+            "  \"removed_cuisines\": string[] | [],\n"
+            "  \"clear_cuisines\": true | false,\n"
             "  \"diet\": string | null,\n"
-            "  \"skill\": string | null\n"
+            "  \"clear_diet\": true | false,\n"
+            "  \"skill\": string | null,\n"
+            "  \"clear_all_preferences\": true | false\n"
             "}"
         )
         sys = (
-            "You analyze a conversation and return a single JSON object with two pieces of information: "
-            "(1) classify the user's most recent query as 'pantry' (adding/removing/viewing ingredients), "
-            "'recipe' (searching for or discussing recipes), or 'general' (anything else); "
-            "(2) extract any food preferences mentioned in the conversation "
-            "(allergies, dietary restrictions, preferred cuisines, diet type, cooking skill level). "
+            "You analyze a conversation and return a single JSON object with two pieces of information:\n\n"
+            "(1) Classify the user's most recent query into one of these types:\n"
+            "  - 'pantry': adding, removing, or viewing ingredients in their pantry\n"
+            "  - 'recipe': searching for recipes, asking what they can cook, or discussing recipes\n"
+            "  - 'selection': user is CHOOSING one of the numbered recipe options that were presented "
+            "(e.g., 'I'll try recipe 2', 'give me option 1', 'let's make the second one', "
+            "'go with number 3', 'the first one please', 'I'd like option 2'). "
+            "Only classify as 'selection' if the conversation history shows recipe options were "
+            "presented AND the user is now choosing one. Set selected_recipe_number to 1, 2, or 3. "
+            "Map ordinal words: 'first'=1, 'second'=2, 'third'=3.\n"
+            "  - 'off_topic': the query has nothing to do with food, cooking, pantry, or nutrition "
+            "(e.g., 'how do I use ChatGPT', 'what's the weather', 'help me with my taxes', "
+            "'write me a poem'). If in doubt, do NOT classify as off_topic.\n"
+            "  - 'preference': the user is explicitly managing their stored preferences — "
+            "viewing them, editing them, removing specific items, or clearing them entirely. "
+            "Use this type when the intent is about preferences themselves, not about a recipe search. "
+            "(e.g., 'show my preferences', 'what are my dietary settings', "
+            "'remove my Asian preference', 'clear all my restrictions', "
+            "'reset my food preferences', 'I want to update my allergies').\n"
+            "  - 'general': anything food/cooking related that doesn't fit the above "
+            "(cooking tips, ingredient questions, greetings, app help)\n\n"
+            "(2) Extract and DIFF the user's food preferences from the LATEST message. "
+            "Preferences can be ADDED, REMOVED, or CLEARED entirely. Use this logic:\n"
+            "  - 'allergies': new allergies the user mentions they HAVE\n"
+            "  - 'removed_allergies': specific allergies the user says they DON'T have or no longer have\n"
+            "  - 'clear_allergies': true if user wants to remove ALL allergies "
+            "(e.g., 'I have no allergies', 'remove all my allergies', 'clear allergies')\n"
+            "  - 'cuisines': cuisines the user WANTS or prefers\n"
+            "  - 'removed_cuisines': specific cuisines the user says they DON'T want\n"
+            "  - 'clear_cuisines': true if user wants to remove ALL cuisine preferences "
+            "(e.g., 'I'll eat any cuisine', 'clear my cuisine preferences', 'remove all cuisines')\n"
+            "  - 'restrictions': dietary restrictions the user HAS\n"
+            "  - 'removed_restrictions': specific restrictions the user says they no longer have\n"
+            "  - 'clear_restrictions': true if user wants to remove ALL dietary restrictions\n"
+            "  - 'diet': the user's diet type as a string (e.g. 'vegan', 'keto'), or null if unchanged\n"
+            "  - 'clear_diet': true ONLY if the user explicitly says they no longer follow their diet\n"
+            "  - 'skill': cooking skill level if mentioned, or null if unchanged\n"
+            "  - 'clear_all_preferences': true if user wants to wipe EVERYTHING "
+            "(e.g., 'reset all preferences', 'clear everything', 'start fresh with no preferences')\n\n"
+            "EXAMPLES:\n"
+            "  'show my preferences' → query_type: 'preference', no changes\n"
+            "  'I don't want Asian, I want Western' → removed_cuisines: ['asian'], cuisines: ['western']\n"
+            "  'remove my Asian preference' → query_type: 'preference', removed_cuisines: ['asian']\n"
+            "  'clear all my allergies' → query_type: 'preference', clear_allergies: true\n"
+            "  'I have no dietary restrictions' → clear_restrictions: true\n"
+            "  'reset all my preferences' → query_type: 'preference', clear_all_preferences: true\n"
+            "  'I'm not vegan anymore' → clear_diet: true\n"
+            "  'I changed my mind, not Italian, give me Japanese' → removed_cuisines: ['italian'], cuisines: ['japanese']\n"
+            "  'I'm not allergic to shellfish anymore' → removed_allergies: ['shellfish']\n\n"
             "Return only the JSON object and nothing else."
         )
 
@@ -1024,8 +1087,13 @@ class ExecutiveChefAgent:
 
         _fallback = {
             "query_type": "general",
-            "allergies": [], "restrictions": [], "cuisines": [],
-            "diet": None, "skill": None
+            "selected_recipe_number": None,
+            "allergies": [], "removed_allergies": [], "clear_allergies": False,
+            "restrictions": [], "removed_restrictions": [], "clear_restrictions": False,
+            "cuisines": [], "removed_cuisines": [], "clear_cuisines": False,
+            "diet": None, "clear_diet": False,
+            "skill": None,
+            "clear_all_preferences": False,
         }
 
         try:
@@ -1041,17 +1109,35 @@ class ExecutiveChefAgent:
                 return [str(x).strip() for x in v if str(x).strip()]
             return [str(v).strip()] if str(v).strip() else []
 
+        VALID_TYPES = ("pantry", "recipe", "general", "selection", "off_topic", "preference")
         qtype = data.get("query_type", "general")
-        if qtype not in ("pantry", "recipe", "general"):
+        if qtype not in VALID_TYPES:
+            qtype = "general"
+
+        raw_num = data.get("selected_recipe_number")
+        selected_num = None
+        if qtype == "selection" and isinstance(raw_num, int) and 1 <= raw_num <= 3:
+            selected_num = raw_num
+        elif qtype == "selection":
+            # LLM said 'selection' but no valid number — ask user to clarify
             qtype = "general"
 
         return {
             "query_type": qtype,
+            "selected_recipe_number": selected_num,
             "allergies": to_list(data.get("allergies")),
+            "removed_allergies": to_list(data.get("removed_allergies")),
+            "clear_allergies": bool(data.get("clear_allergies", False)),
             "restrictions": to_list(data.get("restrictions")),
+            "removed_restrictions": to_list(data.get("removed_restrictions")),
+            "clear_restrictions": bool(data.get("clear_restrictions", False)),
             "cuisines": to_list(data.get("cuisines")),
+            "removed_cuisines": to_list(data.get("removed_cuisines")),
+            "clear_cuisines": bool(data.get("clear_cuisines", False)),
             "diet": data.get("diet"),
+            "clear_diet": bool(data.get("clear_diet", False)),
             "skill": data.get("skill"),
+            "clear_all_preferences": bool(data.get("clear_all_preferences", False)),
         }
 
     def pantry_info_sufficient(self, llm, user_text: str) -> dict:

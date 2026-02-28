@@ -23,6 +23,17 @@ try:
 except Exception:
     TextEmbedding = None
 
+_EMBED_MODEL_CACHE: Dict[str, Any] = {}
+
+
+def _get_embed_model(model_name: str) -> Any:
+    """Return a process-wide singleton for the given fastembed model."""
+    if model_name not in _EMBED_MODEL_CACHE:
+        _EMBED_MODEL_CACHE[model_name] = TextEmbedding(
+            model_name=f"sentence-transformers/{model_name}"
+        )
+    return _EMBED_MODEL_CACHE[model_name]
+
 
 _UNIT_QTY_RE = re.compile(r'(^|\s)\d+\/?\d*\s*(cups?|cup|tbsp|tbs|tbsp\.|tsp|grams?|g|kg|oz|ounces?)', re.I)
 
@@ -95,24 +106,20 @@ class RecipeKnowledgeAgent:
                 print("   Please set them before running with Milvus enabled")
                 return
 
-            # Initialize Zilliz Cloud client
             print(f"🔧 Connecting to Zilliz Cloud...")
-            self.milvus_client = MilvusClient(uri=ZILLIZ_CLUSTER_ENDPOINT, token=ZILLIZ_TOKEN)
+            self.milvus_client = MilvusClient(
+                uri=ZILLIZ_CLUSTER_ENDPOINT,
+                token=ZILLIZ_TOKEN,
+                timeout=15,
+            )
 
-            # Load embedding model
-            print(f"📦 Loading embedding model: sentence-transformers/all-MiniLM-L6-v2...")
-            self.embed_model = TextEmbedding(model_name="sentence-transformers/all-MiniLM-L6-v2")
-            self.embed_dim = 384  # all-MiniLM-L6-v2 always outputs 384 dims
+            print(f"📦 Loading embedding model: sentence-transformers/{embed_model_name}...")
+            self.embed_model = _get_embed_model(embed_model_name)
+            self.embed_dim = 384
 
-            # Check if collection exists
             collections = self.milvus_client.list_collections()
-            collection_exists = self.collection_name in collections
-
-            if collection_exists:
+            if self.collection_name in collections:
                 print(f"✅ Connected to Milvus collection '{self.collection_name}'")
-                # Get collection info
-                stats = self.milvus_client.get_collection_stats(self.collection_name)
-                print(f"   📊 Total recipes in cloud: {stats.get('row_count', 'unknown')}")
             else:
                 print(f"❌ Collection '{self.collection_name}' not found!")
                 print(f"   Please run: python scripts/ingest_recipes_milvus.py --input assets/full_dataset.csv --outdir data --build-milvus")
@@ -301,12 +308,11 @@ class RecipeKnowledgeAgent:
             # Build filter: ingredients array contains any pantry item
             filter_expr = " or ".join([f'array_contains(ingredients, "{ing}")' for ing in pantry_list[:50]])  # Limit to prevent huge query
 
-            # Fetch candidates from Milvus
             results = self.milvus_client.query(
                 collection_name=self.collection_name,
                 filter=filter_expr,
                 output_fields=["id", "title", "ingredients", "source", "link"],
-                limit=1000  # Get more candidates for scoring
+                limit=300,
             )
 
             # Score and filter results
@@ -451,21 +457,18 @@ class RecipeKnowledgeAgent:
 
         pantry_list = list(pantry_items)
 
-        # Get leftover-optimized candidates from Milvus
         pantry_cands = self.pantry_candidates(
             pantry_list,
             allow_missing=allow_missing,
-            top_k=500
+            top_k=150,
         )
 
-        # Get semantic matches if enabled
         sem_cands = []
         if use_semantic and self.milvus_client and self.embed_model:
-            # Pass BOTH query text AND pantry items to semantic search
             sem_cands = self.semantic_search(
                 query=query_text,
                 pantry_items=pantry_list,
-                k=500
+                k=50,
             )
 
         # Build combined scores
