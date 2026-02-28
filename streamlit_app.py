@@ -60,6 +60,15 @@ def init_session_state():
     if "top_3_recommendations" not in st.session_state:
         st.session_state.top_3_recommendations = []
 
+    if "recipe_results" not in st.session_state:
+        st.session_state.recipe_results = []
+
+    if "recommendation_history" not in st.session_state:
+        st.session_state.recommendation_history = []
+
+    if "current_recommendation_page" not in st.session_state:
+        st.session_state.current_recommendation_page = 0
+
     if "current_stage" not in st.session_state:
         st.session_state.current_stage = "initial"
 
@@ -111,6 +120,8 @@ def render_sidebar():
                 st.write(f"**Diet:** {', '.join(prefs['restrictions'])}")
             if prefs.get("cuisines"):
                 st.write(f"**Cuisines:** {', '.join(prefs['cuisines'])}")
+            if prefs.get("excluded_food_types"):
+                st.write(f"**Excluded Types:** {', '.join(prefs['excluded_food_types'])}")
         else:
             st.info("No preferences set yet")
 
@@ -163,21 +174,6 @@ def render_recipe_card(recipe: Dict, index: int):
                 st.write(f"🥘 **{len(ingredients)} ingredients:** {', '.join(ingredients[:5])}")
                 if len(ingredients) > 5:
                     st.caption(f"...and {len(ingredients) - 5} more")
-
-            # Show source and link
-            source = recipe.get('source')
-            link = recipe.get('link', '')
-
-            if source or link:
-                source_text = f"📚 Source: {source}" if source else ""
-                if link:
-                    # Make sure link has protocol
-                    if not link.startswith('http'):
-                        link = f"https://{link}"
-                    link_text = f"[🔗 View Full Recipe]({link})"
-                    st.caption(f"{source_text}  |  {link_text}" if source_text else link_text)
-                elif source:
-                    st.caption(source_text)
 
             # Show directions preview
             directions = recipe.get('directions', [])
@@ -278,6 +274,9 @@ def main():
                         "user_preferences": st.session_state.user_preferences,
                         "pantry_inventory": st.session_state.pantry_inventory,
                         "top_3_recommendations": st.session_state.top_3_recommendations,
+                        "recipe_results": st.session_state.recipe_results,
+                        "recommendation_history": st.session_state.recommendation_history,
+                        "current_recommendation_page": st.session_state.current_recommendation_page,
                         "user_recipe_selection": selected,
                         "messages": context_messages,
                         "coordination_log": [],
@@ -330,6 +329,9 @@ def main():
                     "user_preferences": st.session_state.user_preferences,
                     "pantry_inventory": st.session_state.pantry_inventory,
                     "top_3_recommendations": st.session_state.top_3_recommendations,
+                    "recipe_results": st.session_state.recipe_results,
+                    "recommendation_history": st.session_state.recommendation_history,
+                    "current_recommendation_page": st.session_state.current_recommendation_page,
                     "messages": context_messages,
                     "coordination_log": [],
                     "current_stage": st.session_state.current_stage
@@ -344,6 +346,15 @@ def main():
 
                 if "top_3_recommendations" in result:
                     st.session_state.top_3_recommendations = result["top_3_recommendations"]
+
+                if "recipe_results" in result:
+                    st.session_state.recipe_results = result["recipe_results"]
+
+                if "recommendation_history" in result:
+                    st.session_state.recommendation_history = result["recommendation_history"]
+
+                if "current_recommendation_page" in result:
+                    st.session_state.current_recommendation_page = result["current_recommendation_page"]
 
                 st.session_state.current_stage = result.get("current_stage", "idle")
 

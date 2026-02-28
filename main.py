@@ -87,7 +87,11 @@ class RecipeWorkflowState(MessagesState):
 
     # Recipe search results
     recipe_results: List[Dict[str, Any]]  # Top-k recipes from search (e.g., 10)
-    top_3_recommendations: List[Dict[str, Any]]  # Sous Chef's top 3 picks
+    top_3_recommendations: List[Dict[str, Any]]  # Sous Chef's top 3 picks (active batch)
+
+    # Recommendation pagination
+    recommendation_history: List[List[Dict[str, Any]]]  # All batches shown so far
+    current_recommendation_page: int  # 0-indexed batch pointer
 
     # User selection & final recipe
     user_recipe_selection: Optional[int]  # 1, 2, or 3
@@ -242,7 +246,9 @@ class LeftovrWorkflow:
                 "pantry": "pantry",
                 "recipe": "recipe_search",
                 "general": "general_response",
-                "selection": "customization"  # User selected a recipe
+                "selection": "customization",
+                "more_recipes": "recommendation",  # skip search, reuse existing recipe_results
+                "end": END,                         # pre-resolved responses (back-reference)
             }
         )
 
@@ -323,11 +329,11 @@ class LeftovrWorkflow:
             # "clear all" wipes everything first; individual category clears/adds/removes still apply
             if combined.get("clear_all_preferences"):
                 updated_prefs = {"allergies": [], "restrictions": [], "cuisines": [],
-                                 "diet": None, "skill": None}
+                                 "excluded_food_types": [], "diet": None, "skill": None}
                 print("🗑️  [ORCHESTRATOR] Cleared ALL preferences")
 
             # Apply add/remove diff for each list-type preference
-            for key in ("allergies", "restrictions", "cuisines"):
+            for key in ("allergies", "restrictions", "cuisines", "excluded_food_types"):
                 clear_key = f"clear_{key}"
                 remove_key = f"removed_{key}"
 
@@ -395,21 +401,106 @@ class LeftovrWorkflow:
                 "coordination_log": [f"Bare digit selection: recipe #{num}"]
             }
 
+        # --- "Show me more" (next batch from same search results) ---
+        wants_more = combined.get("wants_more_recommendations", False)
+
+        # Keyword safety net: catch common "more" phrases the classifier may miss
+        if not wants_more and current_stage == "presenting_options" and state.get("top_3_recommendations"):
+            MORE_KEYWORDS = [
+                "more recommendation", "other recommendation", "other option",
+                "more recipe", "other recipe", "more suggestion", "other suggestion",
+                "show me more", "what else", "any other", "different option",
+                "next batch", "don't like these", "not interested",
+                "give me more", "give me other", "i want more",
+            ]
+            if any(kw in user_msg.lower() for kw in MORE_KEYWORDS):
+                wants_more = True
+                print("🔑 [ORCHESTRATOR] Keyword safety net detected 'more recommendations' intent")
+
+        if wants_more:
+            if state.get("recipe_results"):
+                print("🔄 [ORCHESTRATOR] User wants more recommendations from existing results")
+                return {
+                    "query_type": "recipe",
+                    "user_preferences": updated_prefs,
+                    "current_stage": "more_recommendations",
+                    "coordination_log": ["More recommendations requested (same search pool)"]
+                }
+            else:
+                # No cached recipe_results — run a fresh search but preserve history
+                # so the recommendation node can still filter already-shown recipes
+                print("🔄 [ORCHESTRATOR] User wants more but no cached results — routing to fresh search (history preserved)")
+                return {
+                    "query_type": "recipe",
+                    "user_preferences": updated_prefs,
+                    "current_stage": "more_recommendations_needs_search",
+                    "coordination_log": ["More recommendations requested — needs fresh search"]
+                }
+
+        # --- Back-reference to a previous batch ---
+        wants_prev = combined.get("wants_previous_recommendations", False)
+        if wants_prev:
+            history = state.get("recommendation_history", [])
+            current_page = state.get("current_recommendation_page", 0)
+            if history and current_page > 0:
+                prev_page = current_page - 1
+                prev_batch = history[prev_page]
+                prev_sel = combined.get("previous_batch_selection")
+
+                if prev_sel and 1 <= prev_sel <= len(prev_batch):
+                    print(f"✅ [ORCHESTRATOR] Back-reference with selection: batch {prev_page}, recipe #{prev_sel}")
+                    return {
+                        "query_type": "selection",
+                        "user_preferences": updated_prefs,
+                        "top_3_recommendations": prev_batch,
+                        "user_recipe_selection": prev_sel,
+                        "current_recommendation_page": prev_page,
+                        "current_stage": "customization",
+                        "coordination_log": [f"Back-ref selection: batch {prev_page}, recipe #{prev_sel}"]
+                    }
+
+                print(f"🔄 [ORCHESTRATOR] Restoring previous batch {prev_page}")
+                return {
+                    "query_type": "general",
+                    "user_preferences": updated_prefs,
+                    "top_3_recommendations": prev_batch,
+                    "current_recommendation_page": prev_page,
+                    "response": self._format_recommendations(prev_batch, state.get("expiring_items", [])),
+                    "current_stage": "presenting_options",
+                    "coordination_log": [f"Restored previous batch {prev_page}"]
+                }
+            elif history:
+                print("🔄 [ORCHESTRATOR] Already on the first batch — re-presenting")
+                return {
+                    "query_type": "general",
+                    "user_preferences": updated_prefs,
+                    "top_3_recommendations": history[0],
+                    "current_recommendation_page": 0,
+                    "response": self._format_recommendations(history[0], state.get("expiring_items", [])),
+                    "current_stage": "presenting_options",
+                    "coordination_log": ["Re-presented first batch (already on first page)"]
+                }
+
         # Context guard: while recipe cards are on screen, keep follow-up questions
         # in Path B (recipe Q&A) rather than triggering a whole new search.
-        # Only break out of context when user clearly wants a fresh search.
+        # Only break out when user clearly wants a brand-new search OR more recs.
         if (current_stage == "presenting_options"
                 and state.get("top_3_recommendations")
                 and query_type == "recipe"):
             is_new_search = combined.get("is_new_recipe_search", False)
             NEW_SEARCH_SIGNALS = [
                 "search for", "find me", "search again", "different recipe",
-                "something else", "other recipe", "start over", "new recipe",
-                "look for something", "try something else", "show me other",
-                "different options", "other options",
+                "start over", "new recipe", "look for something",
+            ]
+            MORE_SIGNALS = [
+                "more recommendation", "other recommendation", "other option",
+                "more recipe", "other recipe", "more suggestion",
+                "show me more", "what else", "any other", "different option",
+                "next batch", "give me more", "give me other", "i want more",
             ]
             has_new_search_signal = any(sig in user_msg.lower() for sig in NEW_SEARCH_SIGNALS)
-            if not is_new_search and not has_new_search_signal:
+            has_more_signal = any(sig in user_msg.lower() for sig in MORE_SIGNALS)
+            if not is_new_search and not has_new_search_signal and not has_more_signal:
                 print("🔄 [ORCHESTRATOR] Recipe follow-up while presenting options — routing to Q&A (Path B)")
                 query_type = "general"
 
@@ -427,10 +518,24 @@ class LeftovrWorkflow:
     def _route_from_orchestrator(self, state: RecipeWorkflowState) -> str:
         """Decide which node to route to based on query type"""
         query_type = state.get("query_type", "general")
+        current_stage = state.get("current_stage", "")
 
         # If user selected a recipe, go to customization
         if state.get("user_recipe_selection"):
             return "selection"
+
+        # "Show me more" — skip search, go straight to recommendation node
+        if current_stage == "more_recommendations":
+            return "more_recipes"
+
+        # "Show me more" but no cached results — go through search first
+        # (the recommendation node will still filter history)
+        if current_stage == "more_recommendations_needs_search":
+            return "recipe"
+
+        # Back-reference that resolved to a pre-built response — skip to END
+        if state.get("response") and current_stage == "presenting_options":
+            return "end"
 
         # Route based on query type
         routing = {
@@ -533,6 +638,15 @@ class LeftovrWorkflow:
         print(f"✅ [PANTRY] Updated inventory: {len(inventory)} items")
 
         op_types = {op["type"] for op in operations} if operations else set()
+
+        # Proactive recipe suggestion after adding/updating items when no
+        # active recommendations are on screen.
+        MUTATING_OPS = {"add_food_item", "set_food_quantity", "adjust_food_quantity"}
+        has_mutating_op = bool(op_types & MUTATING_OPS)
+        has_active_recs = bool(state.get("top_3_recommendations"))
+        if inventory and has_mutating_op and not has_active_recs:
+            response += "\n\n🍽️ Would you like me to suggest some recipes based on what you have?"
+
         result_dict = {
             "pantry_inventory": inventory,
             "expiring_items": expiring,
@@ -545,6 +659,8 @@ class LeftovrWorkflow:
         # recipe cards don't resurface in the UI.
         if "clear_pantry" in op_types:
             result_dict["top_3_recommendations"] = []
+            result_dict["recommendation_history"] = []
+            result_dict["current_recommendation_page"] = 0
 
         return result_dict
 
@@ -676,6 +792,8 @@ class LeftovrWorkflow:
 
         allergies = preferences.get("allergies") or []
 
+        excluded_food_types = preferences.get("excluded_food_types") or []
+
         try:
             results = self.recipe_agent.hybrid_query(
                 pantry_items=pantry_items,
@@ -685,6 +803,7 @@ class LeftovrWorkflow:
                 use_semantic=True,
                 allergies=allergies if allergies else None,
                 preferred_cuisines=preferences.get("cuisines"),
+                excluded_food_types=excluded_food_types if excluded_food_types else None,
             )
 
             # Preserve score data so the recommendation node can use real
@@ -702,11 +821,16 @@ class LeftovrWorkflow:
 
             print(f"✅ [RECIPE SEARCH] Found {len(recipe_results)} recipes")
 
-            return {
+            is_more_search = state.get("current_stage") == "more_recommendations_needs_search"
+            result_dict = {
                 "recipe_results": recipe_results,
-                "current_stage": "recipe_search_complete",
+                "current_stage": "more_recommendations" if is_more_search else "recipe_search_complete",
                 "coordination_log": [f"Found {len(recipe_results)} recipes via hybrid search"]
             }
+            if not is_more_search:
+                result_dict["recommendation_history"] = []
+                result_dict["current_recommendation_page"] = 0
+            return result_dict
 
         except Exception as e:
             print(f"❌ [RECIPE SEARCH] Error: {e}")
@@ -725,14 +849,19 @@ class LeftovrWorkflow:
     def _recommendation_node(self, state: RecipeWorkflowState) -> Dict[str, Any]:
         """
         Sous Chef analyzes top-k recipes and selects best 3.
-        Considers: ingredient match, expiring items, user skill level.
+        Supports pagination: filters out already-shown recipes when
+        current_stage is 'more_recommendations'.
         """
-        print("\n👨‍🍳 [RECOMMENDATION] Sous Chef selecting top 3...")
+        is_more = state.get("current_stage") == "more_recommendations"
+        label = "next 3" if is_more else "top 3"
+        print(f"\n👨‍🍳 [RECOMMENDATION] Sous Chef selecting {label}...")
 
         recipe_results = state.get("recipe_results", [])
         preferences = state.get("user_preferences", {})
         inventory = state.get("pantry_inventory", [])
         expiring = state.get("expiring_items", [])
+        history = list(state.get("recommendation_history", []))
+        page = state.get("current_recommendation_page", 0)
 
         if not recipe_results:
             if not inventory:
@@ -751,13 +880,40 @@ class LeftovrWorkflow:
                 "coordination_log": ["No recipes found to recommend"]
             }
 
-        # Use Sous Chef's existing generate_recommendations method with creative LLM
+        # Filter out already-shown recipes when paginating
+        pool = recipe_results
+        if is_more and history:
+            already_shown_ids = set()
+            for batch in history:
+                for r in batch:
+                    rid = r.get("recipe_id") or r.get("id") or r.get("title")
+                    if rid:
+                        already_shown_ids.add(rid)
+            pool = [r for r in recipe_results
+                    if (r.get("id") or r.get("title")) not in already_shown_ids]
+            print(f"🔄 [RECOMMENDATION] Filtered pool: {len(pool)} unused of {len(recipe_results)} total")
+
+            if len(pool) < 3:
+                # Expand search with broader params to get more candidates
+                print("🔍 [RECOMMENDATION] Pool exhausted — running broader search")
+                broader = self._run_broader_search(state, already_shown_ids)
+                pool = pool + broader
+                if not pool:
+                    return {
+                        "response": (
+                            "I've shown you all the recipes I found for your current pantry. "
+                            "Try adding more ingredients or adjusting your preferences for fresh results!"
+                        ),
+                        "current_stage": "presenting_options",
+                        "top_3_recommendations": state.get("top_3_recommendations", []),
+                        "coordination_log": ["All recommendation batches exhausted"]
+                    }
+
         pantry_summary = {
             "inventory": inventory,
             "total_ingredients": len(inventory)
         }
 
-        # Soft notice when pantry is empty but semantic search still returned results
         empty_pantry_note = ""
         if not inventory:
             empty_pantry_note = (
@@ -766,24 +922,76 @@ class LeftovrWorkflow:
             )
 
         top_3 = self.sous_chef.generate_recommendations(
-            llm=llm_creative,  # Use creative LLM for recommendations
+            llm=llm_creative,
             pantry_summary=pantry_summary,
             user_preferences=preferences,
             expiring_items=expiring,
-            recipe_results=recipe_results  # Pass the search results
+            recipe_results=pool
         )
 
-        # Format response
-        response = self._format_recommendations(top_3, expiring) + empty_pantry_note
+        # Update history and page
+        history.append(top_3)
+        new_page = len(history) - 1
 
-        print(f"✅ [RECOMMENDATION] Selected top 3 recipes")
+        batch_label = f" (batch {new_page + 1})" if new_page > 0 else ""
+        response = self._format_recommendations(top_3, expiring, batch_label=batch_label) + empty_pantry_note
+
+        print(f"✅ [RECOMMENDATION] Selected {label} recipes (page {new_page})")
 
         return {
             "top_3_recommendations": top_3,
+            "recommendation_history": history,
+            "current_recommendation_page": new_page,
             "response": response,
             "current_stage": "presenting_options",
-            "coordination_log": [f"Sous Chef recommended {len(top_3)} recipes"]
+            "coordination_log": [f"Sous Chef recommended {len(top_3)} recipes (page {new_page})"]
         }
+
+    def _run_broader_search(self, state: RecipeWorkflowState, exclude_ids: set) -> List[Dict[str, Any]]:
+        """Re-run recipe search with relaxed parameters to find more candidates."""
+        if not self._ensure_recipe_agent_ready():
+            return []
+
+        inventory = state.get("pantry_inventory", [])
+        preferences = state.get("user_preferences", {})
+        pantry_items = [item.get("ingredient_name") or item.get("name", "") for item in inventory]
+        pantry_items = [p for p in pantry_items if p]
+
+        query_parts = pantry_items[:8]
+        if preferences.get("cuisines"):
+            query_parts.append(f"{', '.join(preferences['cuisines'])} cuisine")
+        query_text = ", ".join(query_parts)
+
+        try:
+            raw_results = self.recipe_agent.hybrid_query(
+                pantry_items=pantry_items,
+                query_text=query_text,
+                top_k=20,
+                allow_missing=5,
+                allergies=preferences.get("allergies", []),
+                preferred_cuisines=preferences.get("cuisines", []),
+                excluded_food_types=preferences.get("excluded_food_types", []),
+            )
+
+            broader = []
+            for r in raw_results:
+                rid = r.get("id") or r.get("title")
+                if rid in exclude_ids:
+                    continue
+                entry = dict(r)
+                ings = entry.get("ner", entry.get("ingredients", []))
+                pantry_set = {p.lower() for p in pantry_items}
+                ing_set = {i.lower() for i in ings} if ings else set()
+                num_used = len(pantry_set & ing_set)
+                total = len(ings) if ings else 1
+                entry["pantry_items_used"] = num_used
+                entry["missing_ingredients"] = list(ing_set - pantry_set)
+                entry["match_percentage"] = round(num_used / total * 100) if total else 0
+                broader.append(entry)
+            return broader
+        except Exception as e:
+            print(f"⚠️ [RECOMMENDATION] Broader search failed: {e}")
+            return []
 
     def _format_preferences_response(self, prefs: Dict[str, Any], user_msg: str, preference_action: Optional[str] = None) -> str:
         """
@@ -794,10 +1002,11 @@ class LeftovrWorkflow:
         allergies = prefs.get("allergies") or []
         restrictions = prefs.get("restrictions") or []
         cuisines = prefs.get("cuisines") or []
+        excluded_food_types = prefs.get("excluded_food_types") or []
         diet = prefs.get("diet")
         skill = prefs.get("skill")
 
-        is_empty = not any([allergies, restrictions, cuisines, diet, skill])
+        is_empty = not any([allergies, restrictions, cuisines, excluded_food_types, diet, skill])
 
         # Detect if the user was asking to see preferences vs making a change
         view_signals = ["show", "what are", "display", "list", "tell me", "my preference", "what's my", "my setting"]
@@ -805,7 +1014,7 @@ class LeftovrWorkflow:
 
         if is_empty:
             header = "You don't have any preferences saved yet."
-            tip = " Tell me your allergies, preferred cuisines, or dietary needs and I'll remember them!"
+            tip = " Tell me your allergies, preferred cuisines, dietary needs, or food type exclusions and I'll remember them!"
             return f"⚙️ **Your Preferences**\n\n{header}{tip}"
 
         lines = ["⚙️ **Your Current Preferences**\n"]
@@ -816,6 +1025,8 @@ class LeftovrWorkflow:
             lines.append(f"⛔ **Dietary Restrictions:** {', '.join(r.title() for r in restrictions)}")
         if cuisines:
             lines.append(f"🌍 **Preferred Cuisines:** {', '.join(c.title() for c in cuisines)}")
+        if excluded_food_types:
+            lines.append(f"🍽️ **Excluded Food Types:** {', '.join(t.title() for t in excluded_food_types)}")
         if diet:
             lines.append(f"🥗 **Diet:** {diet.title()}")
         if skill:
@@ -828,38 +1039,27 @@ class LeftovrWorkflow:
 
         return "\n".join(lines)
 
-    def _format_recommendations(self, top_3: List[Dict], expiring: List) -> str:
-        """Format top 3 recommendations for user"""
-        response = "🍽️ **Here are my top 3 recipe recommendations:**\n\n"
+    def _format_recommendations(self, top_3: List[Dict], expiring: List, batch_label: str = "") -> str:
+        """Format top 3 recommendations for user. batch_label (e.g. ' (batch 2)') is appended to the header."""
+        header = f"🍽️ **Here are my top 3 recipe recommendations{batch_label}:**\n\n"
+        response = header
 
         for i, recipe in enumerate(top_3, 1):
             response += f"**{i}. {recipe.get('title', 'Unknown Recipe')}**\n"
 
-            # Show ingredient count
             ingredients = recipe.get('ner', []) or recipe.get('ingredients', [])
             if ingredients:
                 response += f"   🥘 {len(ingredients)} ingredients\n"
 
-            # Show timing and servings
             ready_time = recipe.get('readyInMinutes', 'N/A')
             servings = recipe.get('servings', 'N/A')
             if ready_time != 'N/A' or servings != 'N/A':
                 response += f"   ⏱️ {ready_time} min | 👥 {servings} servings\n"
 
-            # Show match percentage from real ingredient overlap data
             match_pct = recipe.get("match_percentage", 0)
             if match_pct:
                 response += f"   🎯 {match_pct}% ingredient match\n"
 
-            # Show recipe link
-            link = recipe.get('link', '')
-            if link:
-                # Make sure link has protocol
-                if not link.startswith('http'):
-                    link = f"https://{link}"
-                response += f"   🔗 [View Recipe]({link})\n"
-
-            # Show why recommended
             reason = recipe.get("recommendation_reason", recipe.get("reasoning", "Great recipe!"))
             response += f"   💡 {reason}\n\n"
 
@@ -867,7 +1067,7 @@ class LeftovrWorkflow:
             expiring_names = [item.get('ingredient_name') or item.get('name', '') for item in expiring[:3]]
             response += f"\n⚠️  Using expiring items: {', '.join(expiring_names)}"
 
-        response += "\n\n✨ **Which recipe would you like to try?** (Reply with 1, 2, or 3)"
+        response += "\n\n✨ **Which recipe would you like to try?** (Reply with 1, 2, or 3, or ask for more options)"
 
         return response
 

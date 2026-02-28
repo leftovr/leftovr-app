@@ -452,6 +452,7 @@ class SousChefAgent:
             query_text = " ".join(query_parts) if query_parts else "dinner recipe"
 
             allergies = user_preferences.get("allergies") or []
+            excluded_food_types = user_preferences.get("excluded_food_types") or []
 
             try:
                 raw_results = self.recipe_knowledge_agent.hybrid_query(
@@ -462,6 +463,7 @@ class SousChefAgent:
                     use_semantic=True,
                     allergies=allergies if allergies else None,
                     preferred_cuisines=user_preferences.get("cuisines"),
+                    excluded_food_types=excluded_food_types if excluded_food_types else None,
                 )
 
                 recipe_results = []
@@ -742,6 +744,7 @@ class SousChefAgent:
         - restrictions: Honor ONLY the restrictions user specified (if any)
         - diet: Adapt ONLY if user has a specific diet (vegan, vegetarian, pescatarian, etc.)
         - cuisines: Consider preferred cuisines if doing substitutions
+        - excluded_food_types: The user does NOT want recipes of these types (e.g. dessert, soup). This recipe has already been pre-filtered, but if it still looks like an excluded type, note it.
         - skill: Simplify steps for beginners, add detail for advanced
 
         CRITICAL SAFETY CHECKS (only if user has these restrictions):
@@ -846,9 +849,6 @@ class SousChefAgent:
                 response_text = response_text.strip()
 
             adapted_recipe = json.loads(response_text)
-
-            adapted_recipe["original_link"] = recipe.get("link")
-            adapted_recipe["original_source"] = recipe.get("source")
 
             self.adaptation_log.append({
                 "timestamp": datetime.now().isoformat(),
@@ -967,21 +967,6 @@ class SousChefAgent:
 
         title = adapted_recipe.get("adapted_title", "Adapted Recipe")
         output = f"# {title}\n\n"
-
-        # Add source and link credit
-        original_source = adapted_recipe.get("original_source")
-        original_link = adapted_recipe.get("original_link")
-
-        if original_source or original_link:
-            output += "---\n"
-            if original_source:
-                output += f"#### **Original Recipe Credit:** {original_source}\n"
-            if original_link:
-                link = original_link
-                if not link.startswith('http'):
-                    link = f"https://{link}"
-                output += f"#### **View Original Recipe:** [Click here]({link})\n"
-            output += "---\n\n"
 
         adaptations = adapted_recipe.get("adaptations_made", [])
         if adaptations:

@@ -991,6 +991,9 @@ class ExecutiveChefAgent:
             clear_diet: bool                 — True if user explicitly removes their diet
             skill: str | None
             clear_all_preferences: bool      — wipe all preference fields at once
+            wants_more_recommendations: bool — user wants next batch from same search
+            wants_previous_recommendations: bool — user wants to revisit an earlier batch
+            previous_batch_selection: 1|2|3|None — recipe pick from that earlier batch
 
         Falls back to {"query_type": "general", all lists empty, all flags false} on parse failure.
         """
@@ -1008,12 +1011,18 @@ class ExecutiveChefAgent:
             "  \"cuisines\": string[] | [],\n"
             "  \"removed_cuisines\": string[] | [],\n"
             "  \"clear_cuisines\": true | false,\n"
+            "  \"excluded_food_types\": string[] | [],\n"
+            "  \"removed_excluded_food_types\": string[] | [],\n"
+            "  \"clear_excluded_food_types\": true | false,\n"
             "  \"diet\": string | null,\n"
             "  \"clear_diet\": true | false,\n"
             "  \"skill\": string | null,\n"
             "  \"clear_all_preferences\": true | false,\n"
             "  \"wants_to_exit_flow\": true | false,\n"
             "  \"is_new_recipe_search\": true | false,\n"
+            "  \"wants_more_recommendations\": true | false,\n"
+            "  \"wants_previous_recommendations\": true | false,\n"
+            "  \"previous_batch_selection\": 1 | 2 | 3 | null,\n"
             "  \"preference_action\": \"view\" | \"update\" | null\n"
             "}"
         )
@@ -1073,6 +1082,12 @@ class ExecutiveChefAgent:
             "  - 'restrictions': dietary restrictions the user HAS\n"
             "  - 'removed_restrictions': specific restrictions the user says they no longer have\n"
             "  - 'clear_restrictions': true if user wants to remove ALL dietary restrictions\n"
+            "  - 'excluded_food_types': food/dish categories the user does NOT want "
+            "(e.g. 'dessert', 'appetizer', 'soup', 'salad', 'beverage', 'bread', 'snack', 'sauce', 'side dish')\n"
+            "  - 'removed_excluded_food_types': food types the user is OK with again "
+            "(e.g. 'actually I do want desserts' → removed_excluded_food_types: ['dessert'])\n"
+            "  - 'clear_excluded_food_types': true if user wants to allow ALL food types again "
+            "(e.g. 'show me any type of recipe', 'no food type restrictions')\n"
             "  - 'diet': the user's diet type as a string (e.g. 'vegan', 'keto'), or null if unchanged\n"
             "  - 'clear_diet': true ONLY if the user explicitly says they no longer follow their diet\n"
             "  - 'skill': cooking skill level if mentioned, or null if unchanged\n"
@@ -1087,7 +1102,12 @@ class ExecutiveChefAgent:
             "  'reset all my preferences' → query_type: 'preference', clear_all_preferences: true\n"
             "  'I'm not vegan anymore' → clear_diet: true\n"
             "  'I changed my mind, not Italian, give me Japanese' → removed_cuisines: ['italian'], cuisines: ['japanese']\n"
-            "  'I'm not allergic to shellfish anymore' → removed_allergies: ['shellfish']\n\n"
+            "  'I'm not allergic to shellfish anymore' → removed_allergies: ['shellfish']\n"
+            "  'no desserts please' → excluded_food_types: ['dessert']\n"
+            "  'skip soups and salads' → excluded_food_types: ['soup', 'salad']\n"
+            "  'actually I want desserts' → removed_excluded_food_types: ['dessert']\n"
+            "  'I don't want appetizers or beverages' → excluded_food_types: ['appetizer', 'beverage']\n"
+            "  'show me any type of food' → clear_excluded_food_types: true\n\n"
             "IMPLICIT REPLACEMENT (critical — 'only', 'just', 'switch to' imply clearing first):\n"
             "  'nevermind I only want western' → clear_cuisines: true, cuisines: ['western']\n"
             "  'actually just Italian' → clear_cuisines: true, cuisines: ['italian']\n"
@@ -1103,11 +1123,29 @@ class ExecutiveChefAgent:
             "'start over', 'scratch that', or pivoting to a completely different topic "
             "mid-flow like asking for recipes while in quantity clarification). "
             "false in all other cases.\n\n"
-            "- 'is_new_recipe_search': true when the user explicitly wants a FRESH recipe "
-            "search (e.g., 'find me something else', 'different recipe', 'search again', "
-            "'show me other options', 'try something else'). false when asking follow-up "
-            "questions about existing recommendations (e.g., 'tell me more about recipe 2', "
-            "'what's in the first one?', 'compare 1 and 3').\n\n"
+            "- 'is_new_recipe_search': true ONLY when the user wants a completely FRESH search "
+            "with different criteria (e.g., 'search for something completely different', "
+            "'find me a pasta dish instead', 'start a new search', 'search again with "
+            "different ingredients'). false for all other cases including 'show me more' requests.\n\n"
+            "- 'wants_more_recommendations': true when the user wants MORE/DIFFERENT options "
+            "from the SAME ingredient pool — they don't like the current batch and want the "
+            "next set (e.g., 'show me more', 'I don't like these', 'other options', "
+            "'more recipes please', 'what else do you have', 'next', 'any other suggestions', "
+            "'give me different options', 'try something else', 'show me other options'). "
+            "This is DIFFERENT from is_new_recipe_search — 'wants_more' keeps the same search "
+            "results and shows the next batch; 'is_new_recipe_search' runs a brand new search.\n\n"
+            "- 'wants_previous_recommendations': true when the user wants to go BACK to a "
+            "previously shown batch of recommendations (e.g., 'go back to the first set', "
+            "'show me the previous options', 'I liked the earlier ones better', "
+            "'what were the first 3 again', 'back to the original recommendations'). "
+            "If the user also picks a specific recipe from that earlier batch, set "
+            "'previous_batch_selection' to 1, 2, or 3 (e.g., 'I want option 2 from the "
+            "first batch' → previous_batch_selection: 2). Otherwise null.\n\n"
+            "AFFIRMATIVE REPLIES AFTER RECIPE SUGGESTION:\n"
+            "When the conversation shows the assistant just asked 'Would you like me to "
+            "suggest some recipes?' (or similar offer), and the user replies with an "
+            "affirmative ('yes', 'sure', 'sounds good', 'go ahead', 'please', 'yeah', "
+            "'let's do it', 'ok'), classify as query_type: 'recipe'.\n\n"
             "- 'preference_action': 'view' when the user wants to SEE their current preferences "
             "(e.g., 'show my preferences', 'what are my settings?', 'what diet am I on?'). "
             "'update' when they are changing/adding/removing preferences. "
@@ -1139,11 +1177,15 @@ class ExecutiveChefAgent:
             "allergies": [], "removed_allergies": [], "clear_allergies": False,
             "restrictions": [], "removed_restrictions": [], "clear_restrictions": False,
             "cuisines": [], "removed_cuisines": [], "clear_cuisines": False,
+            "excluded_food_types": [], "removed_excluded_food_types": [], "clear_excluded_food_types": False,
             "diet": None, "clear_diet": False,
             "skill": None,
             "clear_all_preferences": False,
             "wants_to_exit_flow": False,
             "is_new_recipe_search": False,
+            "wants_more_recommendations": False,
+            "wants_previous_recommendations": False,
+            "previous_batch_selection": None,
             "preference_action": None,
         }
 
@@ -1173,6 +1215,11 @@ class ExecutiveChefAgent:
             # LLM said 'selection' but no valid number — ask user to clarify
             qtype = "general"
 
+        raw_prev_sel = data.get("previous_batch_selection")
+        prev_sel = None
+        if isinstance(raw_prev_sel, int) and 1 <= raw_prev_sel <= 3:
+            prev_sel = raw_prev_sel
+
         return {
             "query_type": qtype,
             "selected_recipe_number": selected_num,
@@ -1185,12 +1232,18 @@ class ExecutiveChefAgent:
             "cuisines": to_list(data.get("cuisines")),
             "removed_cuisines": to_list(data.get("removed_cuisines")),
             "clear_cuisines": bool(data.get("clear_cuisines", False)),
+            "excluded_food_types": to_list(data.get("excluded_food_types")),
+            "removed_excluded_food_types": to_list(data.get("removed_excluded_food_types")),
+            "clear_excluded_food_types": bool(data.get("clear_excluded_food_types", False)),
             "diet": data.get("diet"),
             "clear_diet": bool(data.get("clear_diet", False)),
             "skill": data.get("skill"),
             "clear_all_preferences": bool(data.get("clear_all_preferences", False)),
             "wants_to_exit_flow": bool(data.get("wants_to_exit_flow", False)),
             "is_new_recipe_search": bool(data.get("is_new_recipe_search", False)),
+            "wants_more_recommendations": bool(data.get("wants_more_recommendations", False)),
+            "wants_previous_recommendations": bool(data.get("wants_previous_recommendations", False)),
+            "previous_batch_selection": prev_sel,
             "preference_action": data.get("preference_action"),
         }
 

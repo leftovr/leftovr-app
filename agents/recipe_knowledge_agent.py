@@ -408,6 +408,73 @@ class RecipeKnowledgeAgent:
             return [(hit['id'], hit['distance']) for hit in results[0]]
         return []
 
+    # Maps user-facing food type names to title keywords for filtering.
+    # Since the recipe dataset has no category field, we match against recipe titles.
+    FOOD_TYPE_KEYWORDS: Dict[str, List[str]] = {
+        "dessert": [
+            "cake", "cookie", "cookies", "brownie", "brownies", "pie", "pies",
+            "pudding", "ice cream", "muffin", "muffins", "cupcake", "cupcakes",
+            "fudge", "tart", "tarts", "cheesecake", "pastry", "pastries",
+            "donut", "donuts", "doughnut", "candy", "candies", "frosting",
+            "meringue", "mousse", "sorbet", "gelato", "truffle", "truffles",
+            "macaroon", "macarons", "scone", "scones", "cobbler", "crisp",
+            "parfait", "tiramisu", "baklava", "churro", "churros", "eclair",
+            "profiterole", "cannoli", "panna cotta", "creme brulee",
+            "sweet", "dessert", "confection",
+        ],
+        "appetizer": [
+            "appetizer", "appetizers", "starter", "starters", "bruschetta",
+            "crostini", "canape", "canapes", "hors d'oeuvre", "finger food",
+            "amuse", "tapas",
+        ],
+        "beverage": [
+            "smoothie", "smoothies", "shake", "shakes", "juice", "juices",
+            "cocktail", "cocktails", "lemonade", "tea", "coffee", "punch",
+            "drink", "drinks", "beverage", "beverages", "latte", "frappe",
+            "milkshake", "sangria", "mojito", "margarita", "soda",
+        ],
+        "soup": [
+            "soup", "soups", "stew", "stews", "chowder", "bisque",
+            "broth", "gumbo", "gazpacho", "minestrone", "consomme",
+            "pho", "ramen", "chili",
+        ],
+        "salad": [
+            "salad", "salads", "slaw", "coleslaw",
+        ],
+        "bread": [
+            "bread", "breads", "roll", "rolls", "biscuit", "biscuits",
+            "cornbread", "naan", "focaccia", "bagel", "bagels",
+            "croissant", "croissants", "pretzel", "pretzels", "flatbread",
+            "pita", "tortilla", "tortillas", "loaf",
+        ],
+        "sauce": [
+            "sauce", "sauces", "dressing", "dressings", "marinade",
+            "marinades", "salsa", "chutney", "relish", "condiment",
+            "gravy", "vinaigrette", "aioli", "pesto", "glaze",
+        ],
+        "snack": [
+            "snack", "snacks", "chips", "popcorn", "crackers",
+            "trail mix", "granola bar", "energy ball", "energy balls",
+            "dip", "dips", "hummus", "guacamole",
+        ],
+        "side dish": [
+            "side dish", "side dishes", "side",
+        ],
+        "breakfast": [
+            "breakfast", "pancake", "pancakes", "waffle", "waffles",
+            "omelette", "omelet", "frittata", "cereal", "granola",
+            "french toast", "crepe", "crepes", "porridge", "oatmeal",
+        ],
+    }
+
+    def _matches_food_type(self, title: str, food_type: str) -> bool:
+        """Check if a recipe title matches a given food type category."""
+        title_lower = title.lower()
+        keywords = self.FOOD_TYPE_KEYWORDS.get(food_type.lower(), [])
+        if not keywords:
+            return food_type.lower() in title_lower
+        return any(kw in title_lower for kw in keywords)
+
     def hybrid_query(
         self,
         pantry_items: Optional[Iterable[str]] = None,
@@ -417,6 +484,7 @@ class RecipeKnowledgeAgent:
         use_semantic: bool = True,
         allergies: Optional[List[str]] = None,
         preferred_cuisines: Optional[List[str]] = None,
+        excluded_food_types: Optional[List[str]] = None,
     ) -> List[Tuple[dict, float, int, List[str]]]:
         """
         LEFTOVR HYBRID: Cloud-based recipe search using Milvus
@@ -433,6 +501,7 @@ class RecipeKnowledgeAgent:
             use_semantic: Whether to boost with semantic similarity
             allergies: Ingredients/categories to exclude (e.g. ["seafood", "shrimp"])
             preferred_cuisines: Boost recipes matching these cuisines
+            excluded_food_types: Recipe categories to exclude (e.g. ["dessert", "soup"])
 
         Returns:
             List of (recipe_metadata, combined_score, num_pantry_used, missing_ingredients)
@@ -487,7 +556,8 @@ class RecipeKnowledgeAgent:
         recipe_ids = [rid for rid, _ in ranked]
         recipe_map = self.get_recipes_by_ids(recipe_ids)
 
-        # Post-filter: exclude recipes containing allergy ingredients
+        # Post-filter: exclude recipes by allergies and excluded food types
+        food_type_exclusions = [ft.lower() for ft in (excluded_food_types or [])]
         filtered: List[Tuple[dict, float, int, List[str]]] = []
         for rid, (score, num_used, missing) in ranked:
             meta = recipe_map.get(rid, {'id': rid, 'title': 'Unknown', 'ner': []})
@@ -496,6 +566,10 @@ class RecipeKnowledgeAgent:
                     meta.get('ner', meta.get('ingredients', []))
                 ))
                 if allergy_tokens & recipe_ings:
+                    continue
+            if food_type_exclusions:
+                title = meta.get('title', '')
+                if any(self._matches_food_type(title, ft) for ft in food_type_exclusions):
                     continue
             filtered.append((meta, float(score), num_used, missing))
             if len(filtered) >= top_k:
