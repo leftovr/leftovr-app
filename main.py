@@ -154,19 +154,26 @@ class LeftovrWorkflow:
         # Build workflow graph
         self.graph = self._build_graph()
 
+    def _recipe_agent_is_ready(self) -> bool:
+        """Return True if either the Milvus or Qdrant backend is connected."""
+        return (
+            self.recipe_agent.milvus_client is not None
+            or self.recipe_agent.qdrant_client is not None
+        )
+
     def _ensure_recipe_agent_ready(self) -> bool:
         """
         Lazy-initialise RecipeKnowledgeAgent on first use.
-        Returns True if the agent is ready (milvus_client connected), False otherwise.
+        Returns True if the agent is ready (Milvus or Qdrant connected), False otherwise.
         Thread-safe: if a background warmup is in progress, waits for it.
         """
         if self._warmup_future is not None and not self._recipe_agent_initialized:
             print("⏳ Waiting for background warmup to finish...")
             self._warmup_future.result(timeout=60)
-            return self.recipe_agent.milvus_client is not None
+            return self._recipe_agent_is_ready()
 
         if self._recipe_agent_initialized:
-            return self.recipe_agent.milvus_client is not None
+            return self._recipe_agent_is_ready()
 
         self._recipe_agent_initialized = True
         try:
@@ -182,9 +189,13 @@ class LeftovrWorkflow:
                 self.recipe_agent.set_pantry_agent(self.pantry)
                 self.sous_chef.recipe_knowledge_agent = self.recipe_agent
                 return True
+            elif self.recipe_agent.qdrant_client:
+                print("✅ Recipe Knowledge Agent initialized with local Qdrant fallback")
+                self.recipe_agent.set_pantry_agent(self.pantry)
+                self.sous_chef.recipe_knowledge_agent = self.recipe_agent
+                return True
             else:
-                print("⚠️  Recipe Knowledge Agent: Milvus connection failed")
-                print("   Run: python scripts/ingest_recipes_milvus.py --input assets/full_dataset.csv --outdir data --build-milvus")
+                print("⚠️  Recipe Knowledge Agent: no search backend available (Milvus and Qdrant both failed)")
                 return False
         except Exception as e:
             print(f"⚠️  Recipe agent init failed: {e}")

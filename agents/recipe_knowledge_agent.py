@@ -59,6 +59,10 @@ class RecipeKnowledgeAgent:
         self.embed_dim = None
         self.collection_name = "recipes"
         self.pantry_agent = None  # Injected PantryAgent for inventory access
+        # Qdrant fallback
+        self.qdrant_client = None
+        self.qdrant_embed_model = None
+        self.ingredient_index: Dict[str, List[int]] = {}
 
     def load_directions(self, path: Optional[str] = None) -> None:
         """
@@ -89,12 +93,14 @@ class RecipeKnowledgeAgent:
     def setup_milvus(self, embed_model_name: str = 'all-MiniLM-L6-v2') -> None:
         """
         Initialize Zilliz Cloud (Milvus) client and connect to existing collection.
+        Falls back to local Qdrant automatically if Milvus is unavailable.
 
         Args:
             embed_model_name: SentenceTransformer model name
         """
         if TextEmbedding is None:
-            print("⚠️  fastembed not available, semantic search disabled")
+            print("⚠️  fastembed not available, trying Qdrant fallback...")
+            self._try_qdrant_fallback()
             return
 
         try:
@@ -102,8 +108,8 @@ class RecipeKnowledgeAgent:
             ZILLIZ_TOKEN = os.environ.get('ZILLIZ_TOKEN')
 
             if not ZILLIZ_CLUSTER_ENDPOINT or not ZILLIZ_TOKEN:
-                print("❌ Error: ZILLIZ_CLUSTER_ENDPOINT and ZILLIZ_TOKEN env variables not set.")
-                print("   Please set them before running with Milvus enabled")
+                print("⚠️  Zilliz credentials not set, trying Qdrant fallback...")
+                self._try_qdrant_fallback()
                 return
 
             print(f"🔧 Connecting to Zilliz Cloud...")
@@ -121,13 +127,75 @@ class RecipeKnowledgeAgent:
             if self.collection_name in collections:
                 print(f"✅ Connected to Milvus collection '{self.collection_name}'")
             else:
-                print(f"❌ Collection '{self.collection_name}' not found!")
-                print(f"   Please run: python scripts/ingest_recipes_milvus.py --input assets/full_dataset.csv --outdir data --build-milvus")
+                print(f"❌ Collection '{self.collection_name}' not found in Zilliz, trying Qdrant fallback...")
                 self.milvus_client = None
+                self._try_qdrant_fallback()
 
         except Exception as e:
             print(f"❌ Zilliz Cloud setup failed: {e}")
             self.milvus_client = None
+            self._try_qdrant_fallback()
+
+    def _try_qdrant_fallback(self, qdrant_path: str = './qdrant_data') -> None:
+        """Attempt to set up local Qdrant as a fallback backend."""
+        if os.path.exists(qdrant_path):
+            self.setup_qdrant(qdrant_path=qdrant_path)
+        else:
+            print(f"⚠️  Qdrant data not found at {qdrant_path}. Recipe search unavailable.")
+
+    def setup_qdrant(
+        self,
+        embed_model_name: str = 'all-MiniLM-L6-v2',
+        qdrant_path: str = './qdrant_data',
+    ) -> None:
+        """
+        Initialize local Qdrant as the recipe search backend.
+
+        Args:
+            embed_model_name: SentenceTransformer model name (must match the one used during ingestion)
+            qdrant_path: Path to the local Qdrant storage directory
+        """
+        try:
+            from qdrant_client import QdrantClient as _QdrantClient
+        except ImportError:
+            print("❌ qdrant-client not installed. Run: pip install qdrant-client")
+            return
+
+        try:
+            from sentence_transformers import SentenceTransformer as _ST
+        except ImportError:
+            print("❌ sentence-transformers not installed. Run: pip install sentence-transformers")
+            return
+
+        try:
+            print(f"🔧 Connecting to local Qdrant at {qdrant_path}...")
+            self.qdrant_client = _QdrantClient(path=qdrant_path)
+
+            existing = [c.name for c in self.qdrant_client.get_collections().collections]
+            if self.collection_name not in existing:
+                print(f"❌ Qdrant collection '{self.collection_name}' not found.")
+                print(f"   Run: python scripts/ingest_recipes_qdrant.py --input assets/full_dataset.csv --outdir data --build-qdrant")
+                self.qdrant_client = None
+                return
+
+            print(f"📦 Loading embedding model: {embed_model_name}...")
+            self.qdrant_embed_model = _ST(embed_model_name)
+
+            ing_path = os.path.join(self.data_dir, 'ingredient_index.json')
+            if os.path.exists(ing_path):
+                print(f"📇 Loading ingredient index (this may take a few seconds)...")
+                with open(ing_path, 'r', encoding='utf8') as fh:
+                    self.ingredient_index = json.load(fh)
+                print(f"✅ Loaded {len(self.ingredient_index):,} ingredients from index")
+            else:
+                print(f"⚠️  Ingredient index not found at {ing_path}. Pantry matching will be limited.")
+                self.ingredient_index = {}
+
+            print(f"✅ Qdrant fallback ready (collection '{self.collection_name}')")
+
+        except Exception as e:
+            print(f"❌ Qdrant setup failed: {e}")
+            self.qdrant_client = None
 
     def get_recipe_by_id(self, recipe_id: int) -> Optional[Dict[str, Any]]:
         """
@@ -534,6 +602,128 @@ class RecipeKnowledgeAgent:
             return food_type.lower() in title_lower
         return any(kw in title_lower for kw in keywords)
 
+    # ------------------------------------------------------------------
+    # Qdrant-backed equivalents of pantry_candidates / semantic_search /
+    # get_recipes_by_ids — used when milvus_client is None
+    # ------------------------------------------------------------------
+
+    def _qdrant_pantry_candidates(
+        self,
+        pantry_items: Iterable[str],
+        allow_missing: int = 0,
+        top_k: int = 200,
+    ) -> List[Tuple[int, float, int, List[str]]]:
+        """Ingredient-index lookup against Qdrant payload for pantry matching."""
+        if not self.qdrant_client or not self.ingredient_index:
+            return []
+
+        pantry = set(self.normalize_ingredients(pantry_items))
+        if not pantry:
+            return []
+
+        # Gather candidate recipe IDs from the ingredient index.
+        # Cap per-ingredient to avoid memory explosion for very common tokens.
+        candidate_ids: Set[int] = set()
+        for ing in list(pantry)[:50]:
+            candidate_ids.update(self.ingredient_index.get(ing, [])[:500])
+            if len(candidate_ids) >= 3000:
+                break
+
+        if not candidate_ids:
+            return []
+
+        try:
+            points = self.qdrant_client.retrieve(
+                collection_name=self.collection_name,
+                ids=list(candidate_ids),
+                with_payload=True,
+            )
+        except Exception as e:
+            print(f"❌ Qdrant retrieve error: {e}")
+            return []
+
+        scored: List[Tuple[int, float, int, List[str]]] = []
+        for point in points:
+            recipe_ings = set(point.payload.get('ingredients', []))
+            num_pantry_used = len(pantry & recipe_ings)
+            missing = list(recipe_ings - pantry)
+            num_missing = len(missing)
+            if num_pantry_used >= 1 and num_missing <= allow_missing:
+                score = (
+                    num_pantry_used * 100
+                    + (1000 if num_missing == 0 else 0)
+                    - len(recipe_ings)
+                )
+                scored.append((point.id, float(score), num_pantry_used, missing))
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return scored[:top_k]
+
+    def _qdrant_semantic_search(
+        self,
+        query: Optional[str] = None,
+        pantry_items: Optional[List[str]] = None,
+        k: int = 10,
+    ) -> List[Tuple[int, float]]:
+        """Vector search against local Qdrant."""
+        if not self.qdrant_client or not self.qdrant_embed_model:
+            return []
+
+        query_parts = []
+        if query:
+            query_parts.append(query)
+        if pantry_items:
+            query_parts.append(f"Ingredients: {', '.join(pantry_items)}")
+        if not query_parts:
+            return []
+
+        query_text = ". ".join(query_parts)
+        query_vector = self.qdrant_embed_model.encode(
+            query_text, normalize_embeddings=True
+        ).tolist()
+
+        try:
+            results = self.qdrant_client.search(
+                collection_name=self.collection_name,
+                query_vector=query_vector,
+                limit=k,
+            )
+            return [(hit.id, hit.score) for hit in results]
+        except Exception as e:
+            print(f"❌ Qdrant search error: {e}")
+            return []
+
+    def _qdrant_get_recipes_by_ids(
+        self, recipe_ids: List[int]
+    ) -> Dict[int, Dict[str, Any]]:
+        """Batch-fetch recipe metadata from Qdrant payload."""
+        if not self.qdrant_client or not recipe_ids:
+            return {}
+
+        try:
+            points = self.qdrant_client.retrieve(
+                collection_name=self.collection_name,
+                ids=recipe_ids,
+                with_payload=True,
+            )
+        except Exception as e:
+            print(f"❌ Qdrant retrieve error: {e}")
+            return {}
+
+        recipe_map: Dict[int, Dict[str, Any]] = {}
+        for point in points:
+            p = point.payload
+            recipe = {
+                'id': point.id,
+                'title': p.get('title', ''),
+                'ingredients': p.get('ingredients', []),
+                'source': p.get('source', ''),
+                'link': p.get('link', ''),
+            }
+            recipe['ner'] = recipe['ingredients']
+            recipe_map[point.id] = recipe
+        return recipe_map
+
     def hybrid_query(
         self,
         pantry_items: Optional[Iterable[str]] = None,
@@ -578,26 +768,41 @@ class RecipeKnowledgeAgent:
 
         pantry_list = list(pantry_items)
         allergy_tokens = set(self.normalize_ingredients(allergies)) if allergies else set()
+        use_qdrant = (self.milvus_client is None) and (self.qdrant_client is not None)
 
         # Adaptive allow_missing: start strict, loosen if too few results
         for current_missing in range(0, allow_missing + 1):
-            pantry_cands = self.pantry_candidates(
-                pantry_list,
-                allow_missing=current_missing,
-                top_k=150,
-            )
+            if use_qdrant:
+                pantry_cands = self._qdrant_pantry_candidates(
+                    pantry_list,
+                    allow_missing=current_missing,
+                    top_k=150,
+                )
+            else:
+                pantry_cands = self.pantry_candidates(
+                    pantry_list,
+                    allow_missing=current_missing,
+                    top_k=150,
+                )
             # Require at least 1 pantry ingredient matched
             pantry_cands = [(rid, sc, nu, mi) for rid, sc, nu, mi in pantry_cands if nu >= 1]
             if len(pantry_cands) >= top_k:
                 break
 
         sem_cands = []
-        if use_semantic and self.milvus_client and self.embed_model:
-            sem_cands = self.semantic_search(
-                query=query_text,
-                pantry_items=pantry_list,
-                k=50,
-            )
+        if use_semantic:
+            if self.milvus_client and self.embed_model:
+                sem_cands = self.semantic_search(
+                    query=query_text,
+                    pantry_items=pantry_list,
+                    k=50,
+                )
+            elif use_qdrant and self.qdrant_embed_model:
+                sem_cands = self._qdrant_semantic_search(
+                    query=query_text,
+                    pantry_items=pantry_list,
+                    k=50,
+                )
 
         # Build combined scores
         score_map: Dict[int, Tuple[float, int, List[str]]] = {}
@@ -615,7 +820,10 @@ class RecipeKnowledgeAgent:
         # Fetch recipe metadata for top results
         ranked = sorted(score_map.items(), key=lambda x: x[1][0], reverse=True)[:top_k * 3]
         recipe_ids = [rid for rid, _ in ranked]
-        recipe_map = self.get_recipes_by_ids(recipe_ids)
+        if use_qdrant:
+            recipe_map = self._qdrant_get_recipes_by_ids(recipe_ids)
+        else:
+            recipe_map = self.get_recipes_by_ids(recipe_ids)
 
         # Post-filter: exclude recipes by allergies and excluded food types,
         # and include only preferred food types when specified
