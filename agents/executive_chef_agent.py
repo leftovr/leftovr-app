@@ -1088,6 +1088,13 @@ class ExecutiveChefAgent:
             "(e.g. 'actually I do want desserts' → removed_excluded_food_types: ['dessert'])\n"
             "  - 'clear_excluded_food_types': true if user wants to allow ALL food types again "
             "(e.g. 'show me any type of recipe', 'no food type restrictions')\n"
+            "  - 'preferred_food_types': food/dish categories the user WANTS to see "
+            "(e.g. 'pasta', 'casserole', 'stir fry', 'curry', 'sandwich', 'soup', 'salad', 'main dish', 'rice dish'). "
+            "Use this when the user positively requests a type of dish.\n"
+            "  - 'removed_preferred_food_types': food types the user no longer specifically wants "
+            "(e.g. 'actually not just pasta' → removed_preferred_food_types: ['pasta'])\n"
+            "  - 'clear_preferred_food_types': true if user wants to remove ALL food type preferences "
+            "(e.g. 'show me any type of food', 'no food type preference', 'all types are fine')\n"
             "  - 'diet': the user's diet type as a string (e.g. 'vegan', 'keto'), or null if unchanged\n"
             "  - 'clear_diet': true ONLY if the user explicitly says they no longer follow their diet\n"
             "  - 'skill': cooking skill level if mentioned, or null if unchanged\n"
@@ -1107,7 +1114,18 @@ class ExecutiveChefAgent:
             "  'skip soups and salads' → excluded_food_types: ['soup', 'salad']\n"
             "  'actually I want desserts' → removed_excluded_food_types: ['dessert']\n"
             "  'I don't want appetizers or beverages' → excluded_food_types: ['appetizer', 'beverage']\n"
-            "  'show me any type of food' → clear_excluded_food_types: true\n\n"
+            "  'show me any type of food' → clear_excluded_food_types: true, clear_preferred_food_types: true\n"
+            "  'I only want pasta related' → clear_preferred_food_types: true, preferred_food_types: ['pasta']\n"
+            "  'only main dishes' → clear_preferred_food_types: true, preferred_food_types: ['main dish']\n"
+            "  'I want pasta and curry dishes' → preferred_food_types: ['pasta', 'curry']\n"
+            "  'give me casserole recipes' → preferred_food_types: ['casserole']\n"
+            "  'actually not just pasta anymore' → clear_preferred_food_types: true\n\n"
+            "CRITICAL — preferred_food_types vs excluded_food_types:\n"
+            "Do NOT infer excluded_food_types from a positive request. If the user says "
+            "'I only want X' or 'just X recipes', set preferred_food_types to X. "
+            "Do NOT try to exclude everything else via excluded_food_types. "
+            "preferred_food_types is for WANTING specific types; excluded_food_types is for "
+            "NOT WANTING specific types. These are independent.\n\n"
             "IMPLICIT REPLACEMENT (critical — 'only', 'just', 'switch to' imply clearing first):\n"
             "  'nevermind I only want western' → clear_cuisines: true, cuisines: ['western']\n"
             "  'actually just Italian' → clear_cuisines: true, cuisines: ['italian']\n"
@@ -1115,7 +1133,10 @@ class ExecutiveChefAgent:
             "  'I only like Thai and Japanese' → clear_cuisines: true, cuisines: ['thai', 'japanese']\n"
             "  'forget my old preferences, I'm vegan now' → clear_all_preferences: true, diet: 'vegan'\n"
             "  'instead of Asian, give me Mexican' → removed_cuisines: ['asian'], cuisines: ['mexican']\n"
-            "  'no more restrictions, I eat everything' → clear_restrictions: true, clear_diet: true\n\n"
+            "  'no more restrictions, I eat everything' → clear_restrictions: true, clear_diet: true\n"
+            "  'I only want pasta related' → clear_preferred_food_types: true, preferred_food_types: ['pasta']\n"
+            "  'just curry dishes' → clear_preferred_food_types: true, preferred_food_types: ['curry']\n"
+            "  'switch to stir fry' → clear_preferred_food_types: true, preferred_food_types: ['stir fry']\n\n"
             "KEY RULE: 'only X', 'just X', 'switch to X' = clear the ENTIRE category + set new value(s).\n"
             "'also X', 'add X' = append without clearing.\n\n"
             "- 'wants_to_exit_flow': true when the user wants to cancel, abort, or abandon "
@@ -1178,6 +1199,7 @@ class ExecutiveChefAgent:
             "restrictions": [], "removed_restrictions": [], "clear_restrictions": False,
             "cuisines": [], "removed_cuisines": [], "clear_cuisines": False,
             "excluded_food_types": [], "removed_excluded_food_types": [], "clear_excluded_food_types": False,
+            "preferred_food_types": [], "removed_preferred_food_types": [], "clear_preferred_food_types": False,
             "diet": None, "clear_diet": False,
             "skill": None,
             "clear_all_preferences": False,
@@ -1235,6 +1257,9 @@ class ExecutiveChefAgent:
             "excluded_food_types": to_list(data.get("excluded_food_types")),
             "removed_excluded_food_types": to_list(data.get("removed_excluded_food_types")),
             "clear_excluded_food_types": bool(data.get("clear_excluded_food_types", False)),
+            "preferred_food_types": to_list(data.get("preferred_food_types")),
+            "removed_preferred_food_types": to_list(data.get("removed_preferred_food_types")),
+            "clear_preferred_food_types": bool(data.get("clear_preferred_food_types", False)),
             "diet": data.get("diet"),
             "clear_diet": bool(data.get("clear_diet", False)),
             "skill": data.get("skill"),

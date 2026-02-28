@@ -171,7 +171,7 @@ Guidelines:
 
 SEMANTIC GUIDANCE — ADDING ITEMS:
 - "I have X [item]" / "I bought X" / "add X" / "got X" when item is NOT in pantry:
-  * WITH explicit number ("I have 2 chickens") → add_food_item with quantity
+  * WITH explicit number — digits OR words ("I have 2 chickens", "I have two chickens") → add_food_item with quantity
   * WITH "a/an" article ("I have a tomato") → add_food_item with quantity=1
   * PLURAL without number ("I have oysters") → ask_for_quantity
   * SINGULAR without "a/an" ("I have tomato") → ask_for_quantity (ambiguous)
@@ -224,7 +224,10 @@ QUANTITY CLARIFICATION RULES:
 2. PLURAL without numbers = ask_for_quantity
 3. SINGULAR without "a/an" = ask_for_quantity (ambiguous)
 4. UNCOUNTABLE nouns = ask_for_quantity
-5. EXPLICIT numbers = use that quantity
+5. EXPLICIT numbers (DIGITS OR WORDS) = use that quantity.
+   Word-form numbers count: "two" = 2, "three" = 3, "five" = 5, "ten" = 10, etc.
+   "two broccolis" = add_food_item(name="broccoli", quantity=2)
+   "three apples" = add_food_item(name="apple", quantity=3)
 6. When user responds with numbers after being asked → add_food_item with that quantity
 
 FOOD VALIDATION RULES:
@@ -235,6 +238,8 @@ FOOD VALIDATION RULES:
 Examples:
 ✅ CORRECT:
 - "I have 2 eggs" (NEW) → add_food_item(name="egg", quantity=2)
+- "I have two broccolis" → add_food_item(name="broccoli", quantity=2)
+- "I also have three apples" → add_food_item(name="apple", quantity=3)
 - "I have 11 eggs" (egg ALREADY in pantry with qty 1) → set_food_quantity(name="egg", quantity=11)
 - "I have a tomato" → add_food_item(name="tomato", quantity=1)
 - "I have oysters" → ask_for_quantity(items=["oyster"])
@@ -740,7 +745,7 @@ Only accept food and beverage items in the pantry."""
                 "type": "function",
                 "function": {
                     "name": "ask_for_quantity",
-                    "description": "Ask user for quantity when: (1) PLURAL without numbers ('oysters', 'eggs'), (2) SINGULAR without 'a/an' article ('tomato', 'garlic' - ambiguous), (3) UNCOUNTABLE nouns ('milk', 'rice', 'flour'). DO NOT use for items with 'a/an' (e.g., 'a tomato' = 1). Examples: 'I have oysters' → ask, 'I have milk' → ask, 'I have tomato' → ask, but 'I have a tomato' → add_food_item(quantity=1).",
+                    "description": "Ask user for quantity when: (1) PLURAL without ANY number ('oysters', 'eggs'), (2) SINGULAR without 'a/an' article ('tomato', 'garlic' - ambiguous), (3) UNCOUNTABLE nouns ('milk', 'rice', 'flour'). DO NOT use when user provides a number in ANY form — digit ('2 eggs') OR word ('two broccolis', 'three apples'). Word-form numbers ARE explicit quantities. Examples: 'I have oysters' → ask, 'I have milk' → ask, but 'I have a tomato' → add_food_item(quantity=1), 'I have two broccolis' → add_food_item(quantity=2).",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -758,7 +763,7 @@ Only accept food and beverage items in the pantry."""
                 "type": "function",
                 "function": {
                     "name": "add_food_item",
-                    "description": "Add a NEW food/beverage item to the pantry. Use ONLY when the item does NOT already exist in the pantry. Use when: (1) User states explicit number ('2 chickens', '5 tomatoes'), (2) User uses singular with 'a/an' ('a tomato' = quantity 1). If the item ALREADY EXISTS, use set_food_quantity instead. DO NOT use for plural without number (use ask_for_quantity) or non-food items (reject).",
+                    "description": "Add a NEW food/beverage item to the pantry. Use ONLY when the item does NOT already exist in the pantry. Use when: (1) User states explicit number as digits OR words ('2 chickens', 'two broccolis', 'three apples'), (2) User uses singular with 'a/an' ('a tomato' = quantity 1). If the item ALREADY EXISTS, use set_food_quantity instead. DO NOT use for plural without number (use ask_for_quantity) or non-food items (reject).",
                     "parameters": {
                         "type": "object",
                         "properties": {

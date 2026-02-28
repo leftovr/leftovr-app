@@ -467,10 +467,69 @@ class RecipeKnowledgeAgent:
         ],
     }
 
+    PREFERRED_FOOD_TYPE_KEYWORDS: Dict[str, List[str]] = {
+        "pasta": [
+            "pasta", "noodle", "noodles", "spaghetti", "penne", "fettuccine",
+            "linguine", "macaroni", "lasagna", "lasagne", "ravioli", "tortellini",
+            "rigatoni", "ziti", "orzo", "gnocchi", "carbonara", "bolognese",
+            "alfredo", "primavera", "puttanesca", "marinara", "mac and cheese",
+            "mac & cheese", "manicotti", "cannelloni", "rotini", "farfalle",
+            "tagliatelle", "vermicelli", "lo mein", "pad thai", "udon", "ramen",
+        ],
+        "curry": [
+            "curry", "curried", "tikka", "masala", "korma", "vindaloo",
+            "rendang", "panang", "thai curry", "green curry", "red curry",
+        ],
+        "stir fry": [
+            "stir fry", "stir-fry", "stirfry", "stir fried", "stir-fried",
+            "wok", "fried rice",
+        ],
+        "casserole": [
+            "casserole", "bake", "baked", "gratin", "au gratin", "hotdish",
+        ],
+        "sandwich": [
+            "sandwich", "sandwiches", "burger", "burgers", "wrap", "wraps",
+            "panini", "sub", "hoagie", "club", "blt", "grilled cheese",
+        ],
+        "rice dish": [
+            "rice", "risotto", "pilaf", "biryani", "paella", "jambalaya",
+            "fried rice", "congee", "arroz",
+        ],
+        "main dish": [
+            "chicken", "beef", "pork", "lamb", "turkey", "steak", "roast",
+            "grilled", "baked", "braised", "glazed", "stuffed", "meatloaf",
+            "meatball", "meatballs", "pot roast", "tenderloin", "chop",
+        ],
+        "seafood": [
+            "fish", "salmon", "tuna", "shrimp", "crab", "lobster", "scallop",
+            "clam", "mussel", "oyster", "cod", "tilapia", "halibut", "swordfish",
+            "anchovy", "calamari", "squid", "prawn", "seafood",
+        ],
+        "pizza": [
+            "pizza", "pizzas", "calzone", "flatbread pizza",
+        ],
+        "taco": [
+            "taco", "tacos", "burrito", "burritos", "enchilada", "enchiladas",
+            "quesadilla", "quesadillas", "fajita", "fajitas", "tostada",
+        ],
+    }
+
     def _matches_food_type(self, title: str, food_type: str) -> bool:
-        """Check if a recipe title matches a given food type category."""
+        """Check if a recipe title matches a given food type category (exclusion or preference)."""
         title_lower = title.lower()
         keywords = self.FOOD_TYPE_KEYWORDS.get(food_type.lower(), [])
+        if not keywords:
+            keywords = self.PREFERRED_FOOD_TYPE_KEYWORDS.get(food_type.lower(), [])
+        if not keywords:
+            return food_type.lower() in title_lower
+        return any(kw in title_lower for kw in keywords)
+
+    def _matches_preferred_food_type(self, title: str, food_type: str) -> bool:
+        """Check if a recipe title matches a preferred food type category."""
+        title_lower = title.lower()
+        keywords = self.PREFERRED_FOOD_TYPE_KEYWORDS.get(food_type.lower(), [])
+        if not keywords:
+            keywords = self.FOOD_TYPE_KEYWORDS.get(food_type.lower(), [])
         if not keywords:
             return food_type.lower() in title_lower
         return any(kw in title_lower for kw in keywords)
@@ -485,6 +544,7 @@ class RecipeKnowledgeAgent:
         allergies: Optional[List[str]] = None,
         preferred_cuisines: Optional[List[str]] = None,
         excluded_food_types: Optional[List[str]] = None,
+        preferred_food_types: Optional[List[str]] = None,
     ) -> List[Tuple[dict, float, int, List[str]]]:
         """
         LEFTOVR HYBRID: Cloud-based recipe search using Milvus
@@ -502,6 +562,7 @@ class RecipeKnowledgeAgent:
             allergies: Ingredients/categories to exclude (e.g. ["seafood", "shrimp"])
             preferred_cuisines: Boost recipes matching these cuisines
             excluded_food_types: Recipe categories to exclude (e.g. ["dessert", "soup"])
+            preferred_food_types: Recipe categories to include (e.g. ["pasta", "curry"])
 
         Returns:
             List of (recipe_metadata, combined_score, num_pantry_used, missing_ingredients)
@@ -556,8 +617,10 @@ class RecipeKnowledgeAgent:
         recipe_ids = [rid for rid, _ in ranked]
         recipe_map = self.get_recipes_by_ids(recipe_ids)
 
-        # Post-filter: exclude recipes by allergies and excluded food types
+        # Post-filter: exclude recipes by allergies and excluded food types,
+        # and include only preferred food types when specified
         food_type_exclusions = [ft.lower() for ft in (excluded_food_types or [])]
+        food_type_preferences = [ft.lower() for ft in (preferred_food_types or [])]
         filtered: List[Tuple[dict, float, int, List[str]]] = []
         for rid, (score, num_used, missing) in ranked:
             meta = recipe_map.get(rid, {'id': rid, 'title': 'Unknown', 'ner': []})
@@ -567,9 +630,12 @@ class RecipeKnowledgeAgent:
                 ))
                 if allergy_tokens & recipe_ings:
                     continue
+            title = meta.get('title', '')
             if food_type_exclusions:
-                title = meta.get('title', '')
                 if any(self._matches_food_type(title, ft) for ft in food_type_exclusions):
+                    continue
+            if food_type_preferences:
+                if not any(self._matches_preferred_food_type(title, ft) for ft in food_type_preferences):
                     continue
             filtered.append((meta, float(score), num_used, missing))
             if len(filtered) >= top_k:

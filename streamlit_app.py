@@ -114,14 +114,30 @@ def render_sidebar():
         st.title("👤 Preferences")
         if st.session_state.user_preferences:
             prefs = st.session_state.user_preferences
+            has_any = False
             if prefs.get("allergies"):
-                st.write(f"**Allergies:** {', '.join(prefs['allergies'])}")
+                st.write(f"🚫 **Allergies:** {', '.join(a.title() for a in prefs['allergies'])}")
+                has_any = True
             if prefs.get("restrictions"):
-                st.write(f"**Diet:** {', '.join(prefs['restrictions'])}")
+                st.write(f"⛔ **Restrictions:** {', '.join(r.title() for r in prefs['restrictions'])}")
+                has_any = True
             if prefs.get("cuisines"):
-                st.write(f"**Cuisines:** {', '.join(prefs['cuisines'])}")
+                st.write(f"🌍 **Cuisines:** {', '.join(c.title() for c in prefs['cuisines'])}")
+                has_any = True
+            if prefs.get("preferred_food_types"):
+                st.write(f"🍝 **Preferred Types:** {', '.join(t.title() for t in prefs['preferred_food_types'])}")
+                has_any = True
             if prefs.get("excluded_food_types"):
-                st.write(f"**Excluded Types:** {', '.join(prefs['excluded_food_types'])}")
+                st.write(f"🍽️ **Excluded Types:** {', '.join(t.title() for t in prefs['excluded_food_types'])}")
+                has_any = True
+            if prefs.get("diet"):
+                st.write(f"🥗 **Diet:** {prefs['diet'].title()}")
+                has_any = True
+            if prefs.get("skill"):
+                st.write(f"👨‍🍳 **Skill Level:** {prefs['skill'].title()}")
+                has_any = True
+            if not has_any:
+                st.info("No preferences set yet")
         else:
             st.info("No preferences set yet")
 

@@ -299,7 +299,23 @@ class LeftovrWorkflow:
 
         # One LLM call: classify query AND extract preferences simultaneously
         # Called early so new fields (wants_to_exit_flow, etc.) are available for bypass checks
-        combined = self.exec_chef.classify_and_extract(llm_classifier, classify_messages)
+        try:
+            combined = self.exec_chef.classify_and_extract(llm_classifier, classify_messages)
+        except Exception as e:
+            print(f"⚠️ [ORCHESTRATOR] classify_and_extract failed: {e}")
+            combined = {
+                "query_type": "general", "selected_recipe_number": None,
+                "allergies": [], "removed_allergies": [], "clear_allergies": False,
+                "restrictions": [], "removed_restrictions": [], "clear_restrictions": False,
+                "cuisines": [], "removed_cuisines": [], "clear_cuisines": False,
+                "excluded_food_types": [], "removed_excluded_food_types": [], "clear_excluded_food_types": False,
+                "preferred_food_types": [], "removed_preferred_food_types": [], "clear_preferred_food_types": False,
+                "diet": None, "clear_diet": False, "skill": None,
+                "clear_all_preferences": False, "wants_to_exit_flow": False,
+                "is_new_recipe_search": False, "wants_more_recommendations": False,
+                "wants_previous_recommendations": False, "previous_batch_selection": None,
+                "preference_action": None,
+            }
         query_type = combined.get("query_type", "general")
 
         # CRITICAL: Check if we're in the middle of a multi-turn conversation
@@ -329,11 +345,12 @@ class LeftovrWorkflow:
             # "clear all" wipes everything first; individual category clears/adds/removes still apply
             if combined.get("clear_all_preferences"):
                 updated_prefs = {"allergies": [], "restrictions": [], "cuisines": [],
-                                 "excluded_food_types": [], "diet": None, "skill": None}
+                                 "excluded_food_types": [], "preferred_food_types": [],
+                                 "diet": None, "skill": None}
                 print("🗑️  [ORCHESTRATOR] Cleared ALL preferences")
 
             # Apply add/remove diff for each list-type preference
-            for key in ("allergies", "restrictions", "cuisines", "excluded_food_types"):
+            for key in ("allergies", "restrictions", "cuisines", "excluded_food_types", "preferred_food_types"):
                 clear_key = f"clear_{key}"
                 remove_key = f"removed_{key}"
 
@@ -388,18 +405,23 @@ class LeftovrWorkflow:
                 query_type = "general"
 
         # Fallback: bare digit while in presenting_options OR awaiting_selection
+        top_3_for_selection = state.get("top_3_recommendations", [])
         if (user_msg.strip() in ("1", "2", "3")
                 and state.get("current_stage") in ("presenting_options", "awaiting_selection")
-                and state.get("top_3_recommendations")):
+                and top_3_for_selection):
             num = int(user_msg.strip())
-            print(f"✅ [ORCHESTRATOR] Bare digit selection: recipe #{num}")
-            return {
-                "query_type": "selection",
-                "user_preferences": updated_prefs,
-                "user_recipe_selection": num,
-                "current_stage": "customization",
-                "coordination_log": [f"Bare digit selection: recipe #{num}"]
-            }
+            if 1 <= num <= len(top_3_for_selection):
+                print(f"✅ [ORCHESTRATOR] Bare digit selection: recipe #{num}")
+                return {
+                    "query_type": "selection",
+                    "user_preferences": updated_prefs,
+                    "user_recipe_selection": num,
+                    "current_stage": "customization",
+                    "coordination_log": [f"Bare digit selection: recipe #{num}"]
+                }
+            else:
+                print(f"⚠️ [ORCHESTRATOR] Bare digit {num} out of bounds for {len(top_3_for_selection)} recommendations")
+                query_type = "general"
 
         # --- "Show me more" (next batch from same search results) ---
         wants_more = combined.get("wants_more_recommendations", False)
@@ -565,7 +587,18 @@ class LeftovrWorkflow:
         conversation_history = state.get("messages", [])
 
         import asyncio
-        result = asyncio.run(self.pantry.handle_query(user_msg, conversation_history=conversation_history))
+        try:
+            result = asyncio.run(self.pantry.handle_query(user_msg, conversation_history=conversation_history))
+        except Exception as e:
+            print(f"❌ [PANTRY] handle_query failed: {e}")
+            return {
+                "response": "⚠️ Sorry, I had trouble processing that pantry update. Please try again.",
+                "current_stage": "error",
+                "user_preferences": state.get("user_preferences", {}),
+                "coordination_log": [f"Pantry error: {str(e)}"]
+            }
+
+        pantry_prefs = state.get("user_preferences", {})
 
         # Error (e.g., non-food item rejection)
         if isinstance(result, dict) and result.get("error") and not result.get("needs_clarification"):
@@ -574,6 +607,7 @@ class LeftovrWorkflow:
             return {
                 "response": error_msg,
                 "current_stage": "error",
+                "user_preferences": pantry_prefs,
                 "coordination_log": [f"Error: {error_msg}"]
             }
 
@@ -585,6 +619,7 @@ class LeftovrWorkflow:
             return {
                 "response": msg,
                 "current_stage": "pantry_complete",
+                "user_preferences": pantry_prefs,
                 "coordination_log": ["User cancelled quantity clarification"]
             }
 
@@ -603,6 +638,7 @@ class LeftovrWorkflow:
             return {
                 "response": response,
                 "current_stage": "awaiting_quantity_clarification",
+                "user_preferences": pantry_prefs,
                 "coordination_log": [f"Awaiting quantity for: {', '.join(pending_items)}"]
             }
 
@@ -652,6 +688,7 @@ class LeftovrWorkflow:
             "expiring_items": expiring,
             "response": response,
             "current_stage": "pantry_complete",
+            "user_preferences": pantry_prefs,
             "coordination_log": [f"Pantry updated via natural language"]
         }
 
@@ -771,6 +808,7 @@ class LeftovrWorkflow:
             return {
                 "response": "⚠️  Recipe search is not available. Please run the ingestion script first.",
                 "current_stage": "error",
+                "user_preferences": state.get("user_preferences", {}),
                 "coordination_log": ["Recipe search unavailable - no data loaded"]
             }
 
@@ -791,8 +829,8 @@ class LeftovrWorkflow:
         query_text = " ".join(query_parts) if query_parts else "dinner recipe"
 
         allergies = preferences.get("allergies") or []
-
         excluded_food_types = preferences.get("excluded_food_types") or []
+        preferred_food_types = preferences.get("preferred_food_types") or []
 
         try:
             results = self.recipe_agent.hybrid_query(
@@ -804,6 +842,7 @@ class LeftovrWorkflow:
                 allergies=allergies if allergies else None,
                 preferred_cuisines=preferences.get("cuisines"),
                 excluded_food_types=excluded_food_types if excluded_food_types else None,
+                preferred_food_types=preferred_food_types if preferred_food_types else None,
             )
 
             # Preserve score data so the recommendation node can use real
@@ -825,6 +864,7 @@ class LeftovrWorkflow:
             result_dict = {
                 "recipe_results": recipe_results,
                 "current_stage": "more_recommendations" if is_more_search else "recipe_search_complete",
+                "user_preferences": preferences,
                 "coordination_log": [f"Found {len(recipe_results)} recipes via hybrid search"]
             }
             if not is_more_search:
@@ -839,6 +879,7 @@ class LeftovrWorkflow:
             return {
                 "response": f"❌ Sorry, I encountered an error searching recipes: {str(e)}",
                 "current_stage": "error",
+                "user_preferences": preferences,
                 "coordination_log": [f"Recipe search error: {str(e)}"]
             }
 
@@ -872,13 +913,18 @@ class LeftovrWorkflow:
                         "*\"I have chicken, garlic, and pasta\"* — and I'll suggest recipes right away!"
                     ),
                     "current_stage": "no_results",
+                    "user_preferences": preferences,
                     "coordination_log": ["No recipes found — pantry empty"]
                 }
             return {
                 "response": "😕 I couldn't find any recipes matching your criteria. Try broadening your search or adding more ingredients to your pantry.",
                 "current_stage": "no_results",
+                "user_preferences": preferences,
                 "coordination_log": ["No recipes found to recommend"]
             }
+
+        def _recipe_id(r):
+            return r.get("recipe_id") or r.get("id") or r.get("title") or id(r)
 
         # Filter out already-shown recipes when paginating
         pool = recipe_results
@@ -886,11 +932,8 @@ class LeftovrWorkflow:
             already_shown_ids = set()
             for batch in history:
                 for r in batch:
-                    rid = r.get("recipe_id") or r.get("id") or r.get("title")
-                    if rid:
-                        already_shown_ids.add(rid)
-            pool = [r for r in recipe_results
-                    if (r.get("id") or r.get("title")) not in already_shown_ids]
+                    already_shown_ids.add(_recipe_id(r))
+            pool = [r for r in recipe_results if _recipe_id(r) not in already_shown_ids]
             print(f"🔄 [RECOMMENDATION] Filtered pool: {len(pool)} unused of {len(recipe_results)} total")
 
             if len(pool) < 3:
@@ -906,6 +949,7 @@ class LeftovrWorkflow:
                         ),
                         "current_stage": "presenting_options",
                         "top_3_recommendations": state.get("top_3_recommendations", []),
+                        "user_preferences": preferences,
                         "coordination_log": ["All recommendation batches exhausted"]
                     }
 
@@ -921,13 +965,22 @@ class LeftovrWorkflow:
                 "Tell me what ingredients you have and I'll find recipes that use them!*"
             )
 
-        top_3 = self.sous_chef.generate_recommendations(
-            llm=llm_creative,
-            pantry_summary=pantry_summary,
-            user_preferences=preferences,
-            expiring_items=expiring,
-            recipe_results=pool
-        )
+        try:
+            top_3 = self.sous_chef.generate_recommendations(
+                llm=llm_creative,
+                pantry_summary=pantry_summary,
+                user_preferences=preferences,
+                expiring_items=expiring,
+                recipe_results=pool
+            )
+        except Exception as e:
+            print(f"❌ [RECOMMENDATION] generate_recommendations failed: {e}")
+            return {
+                "response": "⚠️ Sorry, I had trouble generating recipe recommendations. Please try again.",
+                "current_stage": "error",
+                "user_preferences": preferences,
+                "coordination_log": [f"Recommendation generation error: {str(e)}"]
+            }
 
         # Update history and page
         history.append(top_3)
@@ -944,6 +997,7 @@ class LeftovrWorkflow:
             "current_recommendation_page": new_page,
             "response": response,
             "current_stage": "presenting_options",
+            "user_preferences": preferences,
             "coordination_log": [f"Sous Chef recommended {len(top_3)} recipes (page {new_page})"]
         }
 
@@ -963,6 +1017,7 @@ class LeftovrWorkflow:
         query_text = ", ".join(query_parts)
 
         try:
+            pft = preferences.get("preferred_food_types") or []
             raw_results = self.recipe_agent.hybrid_query(
                 pantry_items=pantry_items,
                 query_text=query_text,
@@ -971,21 +1026,20 @@ class LeftovrWorkflow:
                 allergies=preferences.get("allergies", []),
                 preferred_cuisines=preferences.get("cuisines", []),
                 excluded_food_types=preferences.get("excluded_food_types", []),
+                preferred_food_types=pft if pft else None,
             )
 
             broader = []
-            for r in raw_results:
-                rid = r.get("id") or r.get("title")
+            for meta, score, num_used, missing in raw_results:
+                rid = meta.get("id") or meta.get("title")
                 if rid in exclude_ids:
                     continue
-                entry = dict(r)
-                ings = entry.get("ner", entry.get("ingredients", []))
-                pantry_set = {p.lower() for p in pantry_items}
-                ing_set = {i.lower() for i in ings} if ings else set()
-                num_used = len(pantry_set & ing_set)
-                total = len(ings) if ings else 1
+                entry = dict(meta)
+                entry["score"] = float(score)
                 entry["pantry_items_used"] = num_used
-                entry["missing_ingredients"] = list(ing_set - pantry_set)
+                entry["missing_ingredients"] = missing
+                ings = entry.get("ner", entry.get("ingredients", []))
+                total = len(ings) if ings else 1
                 entry["match_percentage"] = round(num_used / total * 100) if total else 0
                 broader.append(entry)
             return broader
@@ -1003,10 +1057,11 @@ class LeftovrWorkflow:
         restrictions = prefs.get("restrictions") or []
         cuisines = prefs.get("cuisines") or []
         excluded_food_types = prefs.get("excluded_food_types") or []
+        preferred_food_types = prefs.get("preferred_food_types") or []
         diet = prefs.get("diet")
         skill = prefs.get("skill")
 
-        is_empty = not any([allergies, restrictions, cuisines, excluded_food_types, diet, skill])
+        is_empty = not any([allergies, restrictions, cuisines, excluded_food_types, preferred_food_types, diet, skill])
 
         # Detect if the user was asking to see preferences vs making a change
         view_signals = ["show", "what are", "display", "list", "tell me", "my preference", "what's my", "my setting"]
@@ -1025,6 +1080,8 @@ class LeftovrWorkflow:
             lines.append(f"⛔ **Dietary Restrictions:** {', '.join(r.title() for r in restrictions)}")
         if cuisines:
             lines.append(f"🌍 **Preferred Cuisines:** {', '.join(c.title() for c in cuisines)}")
+        if preferred_food_types:
+            lines.append(f"🍝 **Preferred Food Types:** {', '.join(t.title() for t in preferred_food_types)}")
         if excluded_food_types:
             lines.append(f"🍽️ **Excluded Food Types:** {', '.join(t.title() for t in excluded_food_types)}")
         if diet:
@@ -1105,16 +1162,22 @@ class LeftovrWorkflow:
         # Get selected recipe
         selected = top_3[selection - 1]
 
-        # Use Sous Chef's existing adapt_recipe method with creative LLM
-        customized = self.sous_chef.adapt_recipe(
-            llm=llm_creative,  # Use creative LLM for recipe adaptation
-            recipe=selected,
-            user_preferences=preferences,
-            pantry_inventory=inventory
-        )
-
-        # Format final recipe using existing method
-        formatted = self.sous_chef.format_recipe_for_user(customized, preferences)
+        try:
+            customized = self.sous_chef.adapt_recipe(
+                llm=llm_creative,
+                recipe=selected,
+                user_preferences=preferences,
+                pantry_inventory=inventory
+            )
+            formatted = self.sous_chef.format_recipe_for_user(customized, preferences)
+        except Exception as e:
+            print(f"❌ [CUSTOMIZATION] adapt_recipe failed: {e}")
+            return {
+                "response": f"⚠️ Sorry, I had trouble customizing **{selected.get('title', 'the recipe')}**. Please try again.",
+                "current_stage": "presenting_options",
+                "user_preferences": preferences,
+                "coordination_log": [f"Customization error: {str(e)}"]
+            }
 
         print(f"✅ [CUSTOMIZATION] Recipe customized: {selected.get('title', 'Unknown')}")
 
@@ -1123,6 +1186,7 @@ class LeftovrWorkflow:
             "customized_recipe": customized,
             "response": formatted,
             "current_stage": "final_recipe",
+            "user_preferences": preferences,
             "coordination_log": [f"Customized recipe #{selection}: {selected.get('title', 'Unknown')}"]
         }
 
@@ -1154,19 +1218,31 @@ class LeftovrWorkflow:
             )
             return {
                 "response": response,
-                "current_stage": current_stage,   # don't disturb existing flow
+                "current_stage": current_stage,
+                "user_preferences": state.get("user_preferences", {}),
                 "coordination_log": ["Off-topic query declined"]
             }
 
         # Path B: Recipe browsing Q&A — stay in context
+        prefs = state.get("user_preferences", {})
         if current_stage == "presenting_options" and top_3:
             print("💬 [GENERAL] Recipe Q&A while browsing options")
-            result = self.sous_chef.converse_about_recommendations(
-                llm_creative,
-                top_3,
-                user_msg,
-                state.get("user_preferences", {})
-            )
+            try:
+                result = self.sous_chef.converse_about_recommendations(
+                    llm_creative,
+                    top_3,
+                    user_msg,
+                    prefs
+                )
+            except Exception as e:
+                print(f"❌ [GENERAL] converse_about_recommendations failed: {e}")
+                return {
+                    "response": "⚠️ Sorry, I had trouble answering that. Could you rephrase your question?",
+                    "top_3_recommendations": top_3,
+                    "current_stage": "presenting_options",
+                    "user_preferences": prefs,
+                    "coordination_log": [f"Recipe Q&A error: {str(e)}"]
+                }
             detected_selection = result.get("selection")
             if detected_selection and 1 <= detected_selection <= len(top_3):
                 return {
@@ -1174,35 +1250,45 @@ class LeftovrWorkflow:
                     "top_3_recommendations": top_3,
                     "user_recipe_selection": detected_selection,
                     "current_stage": "customization",
+                    "user_preferences": prefs,
                     "coordination_log": [f"Recipe Q&A; selection {detected_selection} detected"]
                 }
             return {
                 "response": result.get("reply", ""),
-                "top_3_recommendations": top_3,   # preserve cards in Streamlit
+                "top_3_recommendations": top_3,
                 "current_stage": "presenting_options",
+                "user_preferences": prefs,
                 "coordination_log": ["Recipe Q&A, no selection"]
             }
 
         # Path D: Preference management — show current prefs or confirm changes
         if query_type == "preference":
             print("⚙️  [GENERAL] Preference management query")
-            prefs = state.get("user_preferences", {})
             preference_action = state.get("preference_action")
             response = self._format_preferences_response(prefs, user_msg, preference_action)
             return {
                 "response": response,
-                "current_stage": current_stage,   # don't disturb existing flow
+                "current_stage": current_stage,
+                "user_preferences": prefs,
                 "coordination_log": ["Preference management query handled"]
             }
 
         # Path C: Default general response (waiter mode)
-        response = self.exec_chef.respond_as_waiter(llm, user_msg)
+        try:
+            response = self.exec_chef.respond_as_waiter(llm, user_msg)
+        except Exception as e:
+            print(f"❌ [GENERAL] respond_as_waiter failed: {e}")
+            response = (
+                "I'm your kitchen assistant! I can help you manage your pantry, "
+                "find recipes, and guide you through cooking. What would you like to do?"
+            )
 
         print(f"✅ [GENERAL] Responded to general query")
 
         return {
             "response": response,
             "current_stage": "general_complete",
+            "user_preferences": prefs,
             "coordination_log": ["Handled general query"]
         }
 
