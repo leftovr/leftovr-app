@@ -148,7 +148,7 @@ def render_sidebar():
         if st.session_state.workflow:
             st.success("✅ Workflow ready")
             agent = st.session_state.workflow.recipe_agent
-            if agent and agent.milvus_client:
+            if agent and (agent.milvus_client or agent.qdrant_client):
                 st.success("✅ Hybrid search enabled")
             elif agent and st.session_state.workflow._recipe_agent_initialized:
                 # Initialized but failed (bad creds, no collection, etc.)
